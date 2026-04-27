@@ -139,10 +139,27 @@
 - [x] NEXT: Cycle 8 — Frontier #11 notification pipeline (dumpsys notification,
       notification listener service via Shizuku or shell cmd)
 
-### Cycle 8 — Frontier #11 Notification Pipeline (STARTING)
-- [ ] `notifications_list` — parse dumpsys notification
-- [ ] `notifications_dismiss` / snooze
-- [ ] Notification event stream → event_bus (like logcat)
+### Cycle 8 — Frontier #11 Notification Pipeline (DONE)
+- [x] notifications_list: parse `cmd notification list` + key structure
+- [x] notifications_get: full NotificationRecord extraction
+- [x] notifications_snooze / unsnooze (validated duration bounds)
+- [x] notifications_post: 5 styles + auto tag, proper shell quoting
+- [x] notifications_set_dnd: 6 modes (off/on/none/priority/alarms/all)
+- [x] notifications_dnd_package: per-app DND bypass
+- [x] notifications_stats: count + zen_mode + package bans
+- [x] _shq helper for shell-safe single-quoting
+- [x] Patch-injection bug (ACTIONS marker collision) fixed
+- [x] _ok(text=...) kwarg collision fixed
+- [x] 19 new tests with snooze round-trips + DND state restore
+- [x] Tagged v0.11.0
+- [x] NEXT: Cycle 9 — Frontier #5 media session & AVRCP (play/pause/skip,
+      volume control, current-track metadata via dumpsys media_session)
+
+### Cycle 9 — Frontier #5 Media Session (STARTING)
+- [ ] `media_sessions_list` — parse dumpsys media_session
+- [ ] `media_control` — play/pause/skip/stop via key events or AVRCP
+- [ ] `media_metadata` — current track/artist/album
+- [ ] `media_volume` — set stream volume
 - [ ] Tests
 
 
@@ -193,8 +210,9 @@
 - v0.8.0 — screen frames → agent vision (Frontier #4)
 - v0.9.0 — gesture streaming via motionevent (Frontier #2)
 - v0.10.0 — accessibility / ATC control (Frontier #8)
+- v0.11.0 — notification pipeline (Frontier #11)
 
 ## Stats
-- Cycles completed: 7 / 100
-- Frontiers shipped: 7 / 13
-- Actions in tool: 97 (+7 a11y: list/toggle_service/system_action/captions/magnification/font_scale/status)
+- Cycles completed: 8 / 100
+- Frontiers shipped: 8 / 13
+- Actions in tool: 105 (+8 notifications: list/get/snooze/unsnooze/post/set_dnd/dnd_package/stats)
