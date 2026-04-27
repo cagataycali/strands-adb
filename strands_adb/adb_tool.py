@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import re
+import threading
 import logging
 import os
 import shlex
@@ -960,6 +961,279 @@ def _handle_volume(
 # The @tool
 # ----------------------------------------------------------------------------
 
+
+
+# =============================================================================
+# 📜  Logcat Event Stream  (Frontier #3)
+# =============================================================================
+#
+# Instead of polling `adb logcat -d` for a snapshot, keep a background thread
+# tailing `adb logcat -v threadtime` forever. Parse each line, classify it
+# (notification / crash / battery / package / app-launch / custom), and push
+# structured events into devduck's unified `event_bus`.
+#
+# The agent sees these in its dynamic context automatically (event_bus is
+# already wired into get_context_string in devduck's prompt assembler).
+
+_LOGCAT_STATE: Dict[str, Any] = {
+    "running": False,
+    "process": None,
+    "thread": None,
+    "serial": None,
+    "filters": [],
+    "events_parsed": 0,
+    "started_at": None,
+    "lock": threading.Lock(),
+}
+
+# threadtime format: "MM-DD HH:MM:SS.mmm PID TID LEVEL TAG: MESSAGE"
+_LOGCAT_RE = re.compile(
+    r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})\s+"
+    r"(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<level>[VDIWEF])\s+(?P<tag>[^:]+?):\s*(?P<msg>.*)$"
+)
+
+
+def _classify_logcat(line_parsed: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Classify a parsed logcat line → high-value event or None."""
+    tag = line_parsed["tag"].strip()
+    msg = line_parsed["msg"]
+    level = line_parsed["level"]
+
+    # 1. App crash / ANR
+    if tag == "AndroidRuntime" and level in ("E", "F"):
+        if "FATAL EXCEPTION" in msg or "Process:" in msg:
+            return {
+                "category": "crash",
+                "summary": f"💥 App crash: {msg[:100]}",
+                "severity": "error",
+            }
+    if tag in ("ActivityManager", "am_anr") and "ANR" in msg:
+        return {"category": "anr", "summary": f"🧊 ANR: {msg[:120]}",
+                "severity": "warning"}
+
+    # 2. Low memory
+    if tag == "lowmemorykiller" or (tag == "ActivityManager" and "Low on memory" in msg):
+        return {"category": "low_memory", "summary": f"🧠 {msg[:120]}",
+                "severity": "warning"}
+
+    # 3. Battery state
+    if tag == "BatteryService" or (tag == "healthd" and "battery" in msg.lower()):
+        return {"category": "battery", "summary": f"🔋 {msg[:120]}"}
+
+    # 4. Package install / uninstall
+    if tag in ("PackageManager", "PackageInstaller"):
+        lm = msg.lower()
+        if "installed package" in lm or "installing" in lm:
+            return {"category": "package_install", "summary": f"📦 {msg[:120]}"}
+        if "uninstall" in lm or "removed package" in lm:
+            return {"category": "package_remove", "summary": f"🗑 {msg[:120]}"}
+
+    # 5. Activity / app focus change
+    if tag == "ActivityTaskManager" and "START u0" in msg:
+        # Example: "START u0 {act=... cmp=com.whatsapp/.HomeActivity} from ..."
+        m = re.search(r"cmp=([\w.]+)/", msg)
+        if m:
+            return {
+                "category": "app_launch",
+                "summary": f"🚀 App launched: {m.group(1)}",
+                "package": m.group(1),
+            }
+
+    # 6. Phone call state
+    if tag in ("TelephonyManager", "Telecom", "PhoneStateListener"):
+        if "RINGING" in msg:
+            return {"category": "call_ringing", "summary": f"📞 Incoming call: {msg[:80]}"}
+        if "OFFHOOK" in msg:
+            return {"category": "call_active", "summary": f"📞 Call active"}
+
+    # 7. Wifi connection change
+    if tag == "WifiStateMachine" or tag == "wpa_supplicant":
+        lm = msg.lower()
+        if "connected to" in lm or "connecting to" in lm:
+            return {"category": "wifi_connect", "summary": f"📶 {msg[:120]}"}
+        if "disconnect" in lm:
+            return {"category": "wifi_disconnect", "summary": f"📶❌ {msg[:120]}"}
+
+    return None
+
+
+def _logcat_reader_thread(
+    proc: "subprocess.Popen",
+    serial: Optional[str],
+    source_prefix: str,
+) -> None:
+    """Consume logcat lines, classify, push to event_bus."""
+    try:
+        # Lazy import — keep strands-adb usable without devduck present
+        from devduck.tools.event_bus import bus  # type: ignore
+        has_bus = True
+    except Exception:
+        bus = None
+        has_bus = False
+
+    for raw in iter(proc.stdout.readline, b""):
+        if not _LOGCAT_STATE["running"]:
+            break
+        try:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+        except Exception:
+            continue
+        m = _LOGCAT_RE.match(line)
+        if not m:
+            continue
+        parsed = m.groupdict()
+        evt = _classify_logcat(parsed)
+        if not evt:
+            continue
+
+        with _LOGCAT_STATE["lock"]:
+            _LOGCAT_STATE["events_parsed"] += 1
+
+        if has_bus:
+            bus.emit(
+                event_type=f"phone.log.{evt['category']}",
+                source=source_prefix,
+                summary=evt["summary"],
+                detail=line[:500],
+                metadata={
+                    "category": evt["category"],
+                    "severity": evt.get("severity", "info"),
+                    "tag": parsed["tag"].strip(),
+                    "level": parsed["level"],
+                    "serial": serial or "default",
+                    **{k: v for k, v in evt.items()
+                       if k not in ("category", "summary", "severity")},
+                },
+            )
+
+
+def _handle_log_stream_start(
+    serial: Optional[str], filters: Optional[List[str]]
+) -> Dict[str, Any]:
+    """Start a background logcat reader → event_bus pipeline."""
+    if _LOGCAT_STATE["running"]:
+        return {
+            "status": "success",
+            "content": [{"text": f"logcat stream already running (events: "
+                                  f"{_LOGCAT_STATE['events_parsed']})"}],
+            "already_running": True,
+        }
+
+    cmd = [_adb_bin()]
+    s = serial or _SELECTED_SERIAL
+    if s:
+        cmd += ["-s", s]
+    cmd += ["logcat", "-v", "threadtime"]
+
+    # Custom filters. Default = a curated whitelist of tags that we actually
+    # classify in _classify_logcat(). Everything else silenced to keep the
+    # parse rate sane — logcat can easily hit thousands of lines/sec.
+    spec = filters or [
+        "ActivityTaskManager:I",   # app_launch events are level I
+        "AndroidRuntime:E",        # crash stacks
+        "ActivityManager:W",       # ANR, low memory
+        "PackageManager:I",        # installs/removes
+        "PackageInstaller:I",
+        "BatteryService:*",
+        "healthd:*",
+        "TelephonyManager:*",
+        "Telecom:*",
+        "PhoneStateListener:*",
+        "WifiStateMachine:*",
+        "wpa_supplicant:*",
+        "lowmemorykiller:*",
+        "*:S",                      # silence everything else
+    ]
+    cmd += spec
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        return _err(f"adb binary not found: {_adb_bin()}")
+
+    _LOGCAT_STATE["running"] = True
+    _LOGCAT_STATE["process"] = proc
+    _LOGCAT_STATE["serial"] = s
+    _LOGCAT_STATE["filters"] = spec
+    _LOGCAT_STATE["started_at"] = time.time()
+    _LOGCAT_STATE["events_parsed"] = 0
+
+    t = threading.Thread(
+        target=_logcat_reader_thread,
+        args=(proc, s, f"phone:{s or 'default'}"),
+        daemon=True,
+        name="strands-adb-logcat",
+    )
+    _LOGCAT_STATE["thread"] = t
+    t.start()
+
+    return {
+        "status": "success",
+        "content": [{"text": f"📜 logcat stream started (filters={spec}, "
+                              f"serial={s or 'default'}). "
+                              f"Events pushed to devduck event_bus under "
+                              f"topic `phone.log.*`."}],
+        "pid": proc.pid,
+        "filters": spec,
+    }
+
+
+def _handle_log_stream_stop() -> Dict[str, Any]:
+    """Gracefully stop the background logcat reader."""
+    if not _LOGCAT_STATE["running"]:
+        return {"status": "success",
+                "content": [{"text": "logcat stream is not running"}]}
+
+    _LOGCAT_STATE["running"] = False
+    proc = _LOGCAT_STATE.get("process")
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    parsed = _LOGCAT_STATE["events_parsed"]
+    duration = time.time() - (_LOGCAT_STATE.get("started_at") or time.time())
+    _LOGCAT_STATE["process"] = None
+    _LOGCAT_STATE["thread"] = None
+
+    return {
+        "status": "success",
+        "content": [{"text": f"📜 logcat stream stopped. Parsed "
+                              f"{parsed} events over {duration:.1f}s."}],
+        "events_parsed": parsed,
+        "duration_sec": duration,
+    }
+
+
+def _handle_log_stream_status() -> Dict[str, Any]:
+    """Report current logcat stream state."""
+    running = _LOGCAT_STATE["running"]
+    parsed = _LOGCAT_STATE["events_parsed"]
+    started = _LOGCAT_STATE.get("started_at")
+    duration = (time.time() - started) if started else 0
+    return {
+        "status": "success",
+        "content": [{"text": f"logcat stream: "
+                              f"{'🟢 running' if running else '🔴 stopped'} "
+                              f"| events={parsed} | duration={duration:.1f}s "
+                              f"| filters={_LOGCAT_STATE.get('filters')}"}],
+        "running": running,
+        "events_parsed": parsed,
+        "duration_sec": duration,
+        "filters": _LOGCAT_STATE.get("filters"),
+    }
+
+
 ACTIONS = {
     # device
     "list_devices", "select_device", "device_info", "battery", "wake", "unlock",
@@ -987,6 +1261,8 @@ ACTIONS = {
     "screen_record", "dial", "sms_compose", "media", "volume",
     # camera (v0.4.0)
     "camera_photo", "camera_video",
+    # logcat stream (v0.5.0)
+    "log_stream_start", "log_stream_stop", "log_stream_status",
 }
 
 
@@ -1034,6 +1310,8 @@ def adb(
     facing: str = "back",
     auto_pull: bool = True,
     camera_timeout: int = 15,
+    # Logcat stream (v0.5.0)
+    log_filters: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -1062,6 +1340,8 @@ def adb(
             Logs:    logcat (filter_text, lines)
             Camera:  camera_photo (facing="back"|"front", auto_pull, output_path),
                      camera_video (duration_sec, facing, output_path)
+            Stream:  log_stream_start (filters), log_stream_stop,
+                     log_stream_status — pipes logcat → devduck event_bus
         serial: Device serial (overrides selected). Use list_devices first.
         command: Shell command string for action='shell'.
         x, y: Tap coords.
@@ -1196,6 +1476,12 @@ def adb(
             return _handle_camera_video(
                 duration_sec, output_path, serial, facing, auto_pull,
             )
+        if action == "log_stream_start":
+            return _handle_log_stream_start(serial, log_filters)
+        if action == "log_stream_stop":
+            return _handle_log_stream_stop()
+        if action == "log_stream_status":
+            return _handle_log_stream_status()
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
