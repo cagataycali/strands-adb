@@ -126,11 +126,23 @@
 - [x] NEXT: Cycle 7 — Frontier #8 accessibility/ATC (dumpsys accessibility,
       cmd accessibility, service discovery/control)
 
-### Cycle 7 — Frontier #8 Accessibility / ATC (STARTING)
-- [ ] `accessibility_list_services` — installed + enabled services
-- [ ] `accessibility_enable/disable` — per-service toggle
-- [ ] `accessibility_talkback` — enable/disable TalkBack specifically
-- [ ] `accessibility_captions` — system captioning on/off
+### Cycle 7 — Frontier #8 Accessibility / ATC (DONE)
+- [x] accessibility_list: installed services + enabled state
+- [x] accessibility_toggle_service: alias/pkg/component resolution,
+      idempotent, atomic
+- [x] accessibility_system_action: 22 named actions + numeric passthrough
+- [x] accessibility_captions / magnification / font_scale
+- [x] accessibility_status: full subsystem snapshot
+- [x] Parser bug discovered & fixed (ServiceInfo vs ApplicationInfo bleed)
+- [x] 17 new tests with snapshot/restore cleanup
+- [x] Tagged v0.10.0
+- [x] NEXT: Cycle 8 — Frontier #11 notification pipeline (dumpsys notification,
+      notification listener service via Shizuku or shell cmd)
+
+### Cycle 8 — Frontier #11 Notification Pipeline (STARTING)
+- [ ] `notifications_list` — parse dumpsys notification
+- [ ] `notifications_dismiss` / snooze
+- [ ] Notification event stream → event_bus (like logcat)
 - [ ] Tests
 
 
@@ -180,8 +192,9 @@
 - v0.7.0 — UI query DSL (Frontier #10)
 - v0.8.0 — screen frames → agent vision (Frontier #4)
 - v0.9.0 — gesture streaming via motionevent (Frontier #2)
+- v0.10.0 — accessibility / ATC control (Frontier #8)
 
 ## Stats
-- Cycles completed: 6 / 100
-- Frontiers shipped: 6 / 13
-- Actions in tool: 90 (+4 gesture: gesture_stream, gesture_long_press, gesture_path, gesture_pinch)
+- Cycles completed: 7 / 100
+- Frontiers shipped: 7 / 13
+- Actions in tool: 97 (+7 a11y: list/toggle_service/system_action/captions/magnification/font_scale/status)
