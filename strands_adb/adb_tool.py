@@ -27,7 +27,7 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from strands import tool
 
@@ -166,9 +166,9 @@ def _handle_wake(serial: Optional[str]) -> Dict[str, Any]:
 
 def _handle_unlock(serial: Optional[str], pin: Optional[str]) -> Dict[str, Any]:
     _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial)
-    time.sleep(0.3)
+    time.sleep(0.8)
     _run(["shell", "input", "keyevent", "KEYCODE_MENU"], serial=serial)
-    time.sleep(0.3)
+    time.sleep(0.8)
     _run(["shell", "input", "swipe", "500", "1500", "500", "500", "200"], serial=serial)
     if pin:
         time.sleep(0.5)
@@ -405,7 +405,7 @@ def _handle_camera_photo(
 
     # 2. Wake the device
     _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial, timeout=5)
-    time.sleep(0.3)
+    time.sleep(0.8)
 
     # 3. Launch camera via intent
     r = _run(
@@ -513,7 +513,7 @@ def _handle_camera_video(
     baseline = _latest_dcim_file(serial, extensions=(".mp4",))
 
     _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial, timeout=5)
-    time.sleep(0.3)
+    time.sleep(0.8)
 
     r = _run(
         ["shell", "am", "start", "-a", _CAMERA_INTENT_VIDEO],
@@ -1234,6 +1234,297 @@ def _handle_log_stream_status() -> Dict[str, Any]:
     }
 
 
+
+
+# =============================================================================
+# ⚙️  Settings Mutation  (Frontier #13)
+# =============================================================================
+#
+# Read/write Android settings via `settings` binary (no root) and convenient
+# high-level presets via `svc` / `cmd` binaries. Covers the 90% case the
+# agent needs without fighting permission dialogs.
+#
+# Three tiers:
+#   1. Raw — setting_get/put/delete/list        (generic key-value over any namespace)
+#   2. Preset — ringer/brightness/bluetooth     (semantic, typed, with verification)
+#   3. Diagnostic — setting_dump                (full snapshot of a namespace)
+
+_SETTINGS_NAMESPACES = ("system", "secure", "global")
+
+_RINGER_VALUES = {"normal", "silent", "vibrate"}
+
+def _run_shell_capture(
+    args: List[str], serial: Optional[str], timeout: int = 10
+) -> Tuple[int, str, str]:
+    """Run an adb shell command, capture stdout+stderr. Return (rc, stdout, stderr)."""
+    cmd = [_adb_bin()]
+    s = serial or _SELECTED_SERIAL
+    if s:
+        cmd += ["-s", s]
+    cmd += ["shell"] + args
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+    except FileNotFoundError:
+        return 127, "", f"adb binary not found: {_adb_bin()}"
+
+
+def _handle_setting_get(
+    namespace: str, key: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """settings get <namespace> <key>"""
+    if namespace not in _SETTINGS_NAMESPACES:
+        return _err(f"namespace must be one of {_SETTINGS_NAMESPACES}, got {namespace!r}")
+    rc, out, errout = _run_shell_capture(
+        ["settings", "get", namespace, key], serial
+    )
+    if rc != 0:
+        return _err(f"settings get failed: {errout or out}")
+    value = out if out and out != "null" else None
+    return {
+        "status": "success",
+        "content": [{"text": f"{namespace}/{key} = {value!r}"}],
+        "namespace": namespace,
+        "key": key,
+        "value": value,
+    }
+
+
+def _handle_setting_put(
+    namespace: str, key: str, value: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """settings put <namespace> <key> <value>"""
+    if namespace not in _SETTINGS_NAMESPACES:
+        return _err(f"namespace must be one of {_SETTINGS_NAMESPACES}, got {namespace!r}")
+    rc, out, errout = _run_shell_capture(
+        ["settings", "put", namespace, key, str(value)], serial
+    )
+    if rc != 0:
+        return _err(f"settings put failed: {errout or out}")
+    # Verify
+    rc2, verify, _ = _run_shell_capture(
+        ["settings", "get", namespace, key], serial
+    )
+    return {
+        "status": "success",
+        "content": [{"text": f"✅ {namespace}/{key} = {verify} (was set to {value!r})"}],
+        "namespace": namespace,
+        "key": key,
+        "requested": str(value),
+        "actual": verify,
+        "verified": verify == str(value),
+    }
+
+
+def _handle_setting_delete(
+    namespace: str, key: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """settings delete <namespace> <key>"""
+    if namespace not in _SETTINGS_NAMESPACES:
+        return _err(f"namespace must be one of {_SETTINGS_NAMESPACES}")
+    rc, out, errout = _run_shell_capture(
+        ["settings", "delete", namespace, key], serial
+    )
+    if rc != 0:
+        return _err(f"settings delete failed: {errout or out}")
+    return {
+        "status": "success",
+        "content": [{"text": f"🗑  deleted {namespace}/{key} ({out})"}],
+        "namespace": namespace,
+        "key": key,
+    }
+
+
+def _handle_setting_list(
+    namespace: str, filter_text: Optional[str], serial: Optional[str]
+) -> Dict[str, Any]:
+    """settings list <namespace> — returns parsed dict + summary text."""
+    if namespace not in _SETTINGS_NAMESPACES:
+        return _err(f"namespace must be one of {_SETTINGS_NAMESPACES}")
+    rc, out, errout = _run_shell_capture(
+        ["settings", "list", namespace], serial, timeout=20
+    )
+    if rc != 0:
+        return _err(f"settings list failed: {errout or out}")
+    parsed: Dict[str, str] = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            parsed[k.strip()] = v.strip()
+    if filter_text:
+        ft = filter_text.lower()
+        parsed = {k: v for k, v in parsed.items() if ft in k.lower()}
+    preview = "\n".join(f"  {k} = {v[:80]}" for k, v in list(parsed.items())[:30])
+    more = f"\n  … and {len(parsed) - 30} more" if len(parsed) > 30 else ""
+    return {
+        "status": "success",
+        "content": [{"text": f"⚙️  {len(parsed)} settings in {namespace}"
+                              f"{' matching ' + repr(filter_text) if filter_text else ''}:\n"
+                              f"{preview}{more}"}],
+        "namespace": namespace,
+        "settings": parsed,
+        "count": len(parsed),
+    }
+
+
+# ── High-level presets ─────────────────────────────────────────
+
+def _handle_set_ringer(mode: str, serial: Optional[str]) -> Dict[str, Any]:
+    """Set ringer mode: normal | silent | vibrate."""
+    m = (mode or "").lower()
+    if m not in _RINGER_VALUES:
+        return _err(f"ringer mode must be one of {sorted(_RINGER_VALUES)}, got {mode!r}")
+    rc, out, errout = _run_shell_capture(
+        ["cmd", "audio", "set-ringer-mode", m.upper()], serial
+    )
+    if rc != 0:
+        return _err(f"set-ringer-mode failed: {errout or out}")
+    # Verify via settings (get-ringer-mode is empty on some OEMs like Pixel)
+    time.sleep(0.8)
+    _mode_map = {"0": "silent", "1": "vibrate", "2": "normal"}
+    rc2, verify, _ = _run_shell_capture(
+        ["settings", "get", "global", "mode_ringer"], serial
+    )
+    verified_mode = _mode_map.get(verify, "unknown")
+    verified = verified_mode == m
+    return {
+        "status": "success",
+        "content": [{"text": f"🔔 ringer → {m.upper()} "
+                              f"(verified via mode_ringer={verify} → {verified_mode})"}],
+        "mode": m,
+        "verified_mode": verified_mode,
+        "verified": verified,
+    }
+
+
+def _handle_set_brightness(
+    level: int, auto: Optional[bool], serial: Optional[str]
+) -> Dict[str, Any]:
+    """Set screen brightness (0-255). Optionally toggle auto mode."""
+    try:
+        lv = int(level)
+    except (TypeError, ValueError):
+        return _err(f"brightness level must be int 0-255, got {level!r}")
+    if not 0 <= lv <= 255:
+        return _err(f"brightness level must be 0-255, got {lv}")
+
+    # Optionally set auto mode first (0 = manual, 1 = auto)
+    if auto is not None:
+        mode_val = "1" if auto else "0"
+        _run_shell_capture(
+            ["settings", "put", "system", "screen_brightness_mode", mode_val],
+            serial,
+        )
+
+    rc, out, errout = _run_shell_capture(
+        ["settings", "put", "system", "screen_brightness", str(lv)], serial
+    )
+    if rc != 0:
+        return _err(f"set brightness failed: {errout or out}")
+    # verify
+    rc2, verify, _ = _run_shell_capture(
+        ["settings", "get", "system", "screen_brightness"], serial
+    )
+    return {
+        "status": "success",
+        "content": [{"text": f"☀️  brightness → {lv}/255 "
+                              f"(verified: {verify}, auto={auto})"}],
+        "level": lv,
+        "auto": auto,
+        "verified": verify,
+    }
+
+
+def _handle_set_bluetooth(enabled: bool, serial: Optional[str]) -> Dict[str, Any]:
+    """Enable/disable bluetooth via `svc bluetooth`."""
+    verb = "enable" if enabled else "disable"
+    rc, out, errout = _run_shell_capture(
+        ["svc", "bluetooth", verb], serial
+    )
+    # svc prints "Success" but returns 0 even on silent-fail; verify
+    time.sleep(1.0)
+    rc2, verify, _ = _run_shell_capture(
+        ["settings", "get", "global", "bluetooth_on"], serial
+    )
+    verified = (verify == "1") == enabled
+    return {
+        "status": "success" if verified else "error",
+        "content": [{"text": f"{'📶' if enabled else '📴'} bluetooth → "
+                              f"{verb} ({'verified' if verified else 'NOT verified — may need UI'})"}],
+        "enabled": enabled,
+        "verified": verified,
+        "current": verify,
+    }
+
+
+def _handle_set_airplane_mode(enabled: bool, serial: Optional[str]) -> Dict[str, Any]:
+    """Toggle airplane mode flag.
+
+    NOTE: flipping the bit works, but the system broadcast is blocked for
+    adb shell UID → radios may not actually cycle until user interaction.
+    Returned `radios_affected` is False as honest feedback.
+    """
+    rc, out, errout = _run_shell_capture(
+        ["settings", "put", "global", "airplane_mode_on", "1" if enabled else "0"],
+        serial,
+    )
+    if rc != 0:
+        return _err(f"set airplane_mode_on failed: {errout or out}")
+    # Try the broadcast — may fail with SecurityException, that's ok
+    _run_shell_capture(
+        [
+            "am", "broadcast", "-a", "android.intent.action.AIRPLANE_MODE",
+            "--ez", "state", "true" if enabled else "false",
+        ],
+        serial,
+    )
+    rc2, verify, _ = _run_shell_capture(
+        ["settings", "get", "global", "airplane_mode_on"], serial
+    )
+    return {
+        "status": "success",
+        "content": [{"text": f"✈️  airplane_mode_on = {verify} "
+                              f"(flag set; radios may need UI toggle to actually cycle)"}],
+        "enabled": enabled,
+        "verified_flag": verify,
+        "radios_affected": False,
+        "caveat": "settings flag set; broadcast intent blocked for shell UID. "
+                  "User may need to open Quick Settings for radios to actually change.",
+    }
+
+
+def _handle_setting_dump(
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """Snapshot all three namespaces for agent context / debugging."""
+    out: Dict[str, Dict[str, str]] = {}
+    for ns in _SETTINGS_NAMESPACES:
+        rc, raw, _ = _run_shell_capture(
+            ["settings", "list", ns], serial, timeout=30
+        )
+        if rc == 0:
+            parsed = {}
+            for line in raw.splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    parsed[k.strip()] = v.strip()
+            out[ns] = parsed
+        else:
+            out[ns] = {}
+    total = sum(len(v) for v in out.values())
+    return {
+        "status": "success",
+        "content": [{"text": f"📊 dumped {total} settings across "
+                              f"{list(out.keys())} namespaces"}],
+        "snapshot": out,
+        "total": total,
+    }
+
+
 ACTIONS = {
     # device
     "list_devices", "select_device", "device_info", "battery", "wake", "unlock",
@@ -1263,6 +1554,10 @@ ACTIONS = {
     "camera_photo", "camera_video",
     # logcat stream (v0.5.0)
     "log_stream_start", "log_stream_stop", "log_stream_status",
+    # settings mutation (v0.6.0)
+    "setting_get", "setting_put", "setting_delete", "setting_list",
+    "setting_dump", "set_ringer", "set_brightness", "set_bluetooth",
+    "set_airplane_mode",
 }
 
 
@@ -1312,6 +1607,11 @@ def adb(
     camera_timeout: int = 15,
     # Logcat stream (v0.5.0)
     log_filters: Optional[List[str]] = None,
+    # Settings mutation (v0.6.0)
+    namespace: Optional[str] = None,
+    setting_key: Optional[str] = None,
+    setting_value: Optional[Any] = None,
+    auto_brightness: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -1342,6 +1642,12 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Settings: setting_get/put/delete/list (namespace, setting_key, setting_value),
+                      setting_dump (full snapshot),
+                      set_ringer (setting_value="normal"|"silent"|"vibrate"),
+                      set_brightness (setting_value=0..255, auto_brightness=True/False),
+                      set_bluetooth (setting_value=True/False),
+                      set_airplane_mode (setting_value=True/False, flag only)
         serial: Device serial (overrides selected). Use list_devices first.
         command: Shell command string for action='shell'.
         x, y: Tap coords.
@@ -1482,6 +1788,40 @@ def adb(
             return _handle_log_stream_stop()
         if action == "log_stream_status":
             return _handle_log_stream_status()
+
+        # Settings (v0.6.0)
+        if action == "setting_get":
+            return _handle_setting_get(
+                namespace or "system", setting_key or "", serial
+            )
+        if action == "setting_put":
+            return _handle_setting_put(
+                namespace or "system", setting_key or "",
+                setting_value if setting_value is not None else "", serial
+            )
+        if action == "setting_delete":
+            return _handle_setting_delete(
+                namespace or "system", setting_key or "", serial
+            )
+        if action == "setting_list":
+            return _handle_setting_list(
+                namespace or "system", filter_text, serial
+            )
+        if action == "setting_dump":
+            return _handle_setting_dump(serial)
+        if action == "set_ringer":
+            return _handle_set_ringer(setting_value or "normal", serial)
+        if action == "set_brightness":
+            lv = int(setting_value) if setting_value is not None else 128
+            return _handle_set_brightness(lv, auto_brightness, serial)
+        if action == "set_bluetooth":
+            return _handle_set_bluetooth(
+                bool(setting_value) if setting_value is not None else True, serial
+            )
+        if action == "set_airplane_mode":
+            return _handle_set_airplane_mode(
+                bool(setting_value) if setting_value is not None else False, serial
+            )
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
