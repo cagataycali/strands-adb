@@ -28,8 +28,8 @@
 
 ## Frontier implementation order (from priority matrix)
 1. ✅ **Frontier #5 — Physical camera** — SHIPPED v0.4.0
-2. 🟢 **Frontier #3 — Logcat event stream → event_bus** ← NEXT
-3. 🟢 **Frontier #13 — Settings mutation**
+2. ✅ **Frontier #3 — Logcat event stream → event_bus** — SHIPPED v0.5.0
+3. 🟢 **Frontier #13 — Settings mutation** ← NEXT
 4. 🟢 **Frontier #1 — Sensor streams (polling mode)**
 5. 🟢 **Frontier #9 — Location (coarse via cell/wifi)**
 6. 🟢 **Frontier #10 — Multi-device fleet**
@@ -60,11 +60,23 @@
 - [x] Tagged v0.4.0
 - [x] NEXT: Cycle 2 — Frontier #3 Logcat event stream
 
-### Cycle 2 — Frontier #3 Logcat → event_bus (STARTING)
-- [ ] Check devduck event_bus API surface
-- [ ] Write `log_stream_start/stop/status` actions
-- [ ] Parser: logcat tag → structured event
-- [ ] Test: trigger notif, verify event appears
+### Cycle 2 — Frontier #3 Logcat Stream (DONE)
+- [x] Scoped devduck event_bus API (`bus.emit(event_type, source, summary, detail, metadata)`)
+- [x] Confirmed logcat threadtime format: `MM-DD HH:MM:SS.mmm PID TID LEVEL TAG: MESSAGE`
+- [x] Implemented 10-category classifier (crash, anr, app_launch, call, wifi, battery, ...)
+- [x] Background subprocess.Popen + daemon thread reader
+- [x] Lazy import of devduck.event_bus → stays usable without devduck
+- [x] Default filter = whitelist of tags we classify (ActivityTaskManager:I etc.)
+  followed by `*:S` to silence everything else — sane parse rate
+- [x] Graceful terminate + idempotent start/stop
+- [x] Tests: classifier unit + live start/stop + real app_launch captured
+- [x] Tagged v0.5.0
+- [x] NEXT: Cycle 3 — Frontier #13 Settings mutation
+
+### Cycle 3 — Frontier #13 Settings Mutation (STARTING)
+- [ ] `setting_get(namespace, key)` / `setting_put(namespace, key, value)`
+- [ ] Presets: airplane_mode, bluetooth, brightness, ringer
+- [ ] Tests
 
 
 ---
@@ -82,12 +94,12 @@
 - [x] Tagged v0.4.0 ✅ SHIPPED
 
 ### Frontier #3 — Logcat Stream
-- [ ] `log_stream_start(filters=["*:W"])` launches background thread
-- [ ] Parser extracts structured events (crash, notification, battery)
-- [ ] Pushes to devduck `event_bus` under `phone.log.*`
-- [ ] `log_stream_stop()` cleanly kills subprocess
-- [ ] Test: triggers a notification, verifies event appears on bus
-- [ ] Tagged v0.5.0
+- [x] `log_stream_start(log_filters=[...])` launches background thread (default = curated tag whitelist)
+- [x] Parser extracts 10 categories: crash, anr, low_memory, battery, package_install, package_remove, app_launch, call_ringing, call_active, wifi_connect, wifi_disconnect
+- [x] Pushes to devduck `event_bus` under `phone.log.*`
+- [x] `log_stream_stop()` cleanly kills subprocess
+- [x] Test: live app launch → bus event captured on real device
+- [x] Tagged v0.5.0 ✅ SHIPPED
 
 ### Frontier #13 — Settings Mutation
 - [ ] `setting_get(namespace, key)` / `setting_put(...)`
@@ -108,8 +120,9 @@
 - v0.2.0 — screenshot → image block
 - v0.3.0 — smart UI + sensors + thermals + comms
 - v0.4.0 — camera_photo + camera_video (Frontier #5)
+- v0.5.0 — logcat event stream → event_bus (Frontier #3)
 
 ## Stats
-- Cycles completed: 1 / 100
-- Frontiers shipped: 1 / 13
-- Actions in tool: 69 (+camera_photo, +camera_video)
+- Cycles completed: 2 / 100
+- Frontiers shipped: 2 / 13
+- Actions in tool: 72 (+camera_photo, +camera_video, +log_stream_start/stop/status)
