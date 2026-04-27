@@ -159,24 +159,6 @@ def _handle_battery(serial: Optional[str]) -> Dict[str, Any]:
     return _ok(r["stdout"][:2000])
 
 
-def _handle_wake(serial: Optional[str]) -> Dict[str, Any]:
-    _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial)
-    return _ok("device woken")
-
-
-def _handle_unlock(serial: Optional[str], pin: Optional[str]) -> Dict[str, Any]:
-    _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial)
-    time.sleep(0.8)
-    _run(["shell", "input", "keyevent", "KEYCODE_MENU"], serial=serial)
-    time.sleep(0.8)
-    _run(["shell", "input", "swipe", "500", "1500", "500", "500", "200"], serial=serial)
-    if pin:
-        time.sleep(0.5)
-        _run(["shell", "input", "text", pin], serial=serial)
-        _run(["shell", "input", "keyevent", "KEYCODE_ENTER"], serial=serial)
-    return _ok("unlock attempted")
-
-
 def _handle_shell(command: str, serial: Optional[str], timeout: int) -> Dict[str, Any]:
     if not command:
         return _err("command required")
@@ -3647,6 +3629,320 @@ def _handle_power_subsystems(serial: Optional[str]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# 🔓  Session Lifecycle & Smart Unlock  (Frontier #14)
+# =============================================================================
+#
+# Actions:
+#   is_locked       → {locked: bool, trust_state, awake}
+#   wake            → wake device (no unlock, just screen on)
+#   sleep           → power off screen + lock
+#   unlock          → full state machine: wake → dismiss bouncer → enter PIN
+#                     → verify. Handles AlternateBouncerView (biometric) and
+#                     PrimaryBouncer (PIN pad) on modern Pixels.
+#   keep_awake      → toggle stay_on_while_plugged_in
+#
+# How the lockscreen state machine works on Pixel 10 / Android 16:
+#
+#   1. Device wakes → AlternateBouncerView appears (fingerprint icon only)
+#   2. Tap the fingerprint sensor coords → PIN pad appears (PrimaryBouncer)
+#   3. Tap digits → tap Enter → keyguard dismisses
+#   4. Focus switches to NexusLauncherActivity → deviceLocked=0
+#
+# Older devices show the PIN pad directly after a swipe-up. We auto-detect
+# the bouncer type by looking for '0'-'9' content-desc buttons in the dump.
+
+import re as _re_lock
+
+
+def _dumpsys_trust(serial: Optional[str]) -> str:
+    r = _run(["shell", "dumpsys", "trust"], serial=serial, timeout=8)
+    return r["stdout"] or ""
+
+
+def _read_device_locked(serial: Optional[str]) -> Optional[bool]:
+    """Return True/False, or None if we can't tell."""
+    out = _dumpsys_trust(serial)
+    m = _re_lock.search(r"deviceLocked=(\d+)", out)
+    return (m.group(1) == "1") if m else None
+
+
+def _ui_dump(serial: Optional[str]) -> str:
+    """Return UIAutomator XML dump for the current screen."""
+    r = _run(
+        ["shell",
+         "uiautomator dump /sdcard/adbtool_dump.xml >/dev/null 2>&1 && "
+         "cat /sdcard/adbtool_dump.xml"],
+        serial=serial, timeout=10,
+    )
+    return r["stdout"] or ""
+
+
+def _find_node_center(xml: str, content_desc: str) -> Optional[Tuple[int, int]]:
+    """Find first node with given content-desc, return center (x,y)."""
+    # Escape for regex use in the content-desc value
+    cd = _re_lock.escape(content_desc)
+    pattern = _re_lock.compile(
+        r'content-desc="' + cd + r'"[^/]*'
+        r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"'
+    )
+    m = pattern.search(xml)
+    if not m:
+        return None
+    x1, y1, x2, y2 = map(int, m.groups())
+    return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+
+def _tap(x: int, y: int, serial: Optional[str]) -> None:
+    _run(["shell", "input", "tap", str(x), str(y)], serial=serial, timeout=5)
+
+
+def _handle_is_locked(serial: Optional[str]) -> Dict[str, Any]:
+    """Quick lock-state query — returns locked + awake + trust signals."""
+    trust_out = _dumpsys_trust(serial)
+    locked_m = _re_lock.search(r"deviceLocked=(\d+)", trust_out)
+    trust_m = _re_lock.search(r"trustState=(\w+)", trust_out)
+
+    # Wakefulness from power manager
+    r_pow = _run(["shell", "dumpsys", "power"], serial=serial, timeout=8)
+    wake_m = _re_lock.search(r"mWakefulness=(\w+)", r_pow["stdout"] or "")
+
+    locked = (locked_m.group(1) == "1") if locked_m else None
+    awake = (wake_m.group(1) == "Awake") if wake_m else None
+    trust_state = trust_m.group(1) if trust_m else None
+
+    summary = (
+        f"🔒 locked={locked}  awake={awake}  trust={trust_state}"
+    )
+    return _ok(
+        summary,
+        locked=locked,
+        awake=awake,
+        wakefulness=(wake_m.group(1) if wake_m else None),
+        trust_state=trust_state,
+    )
+
+
+def _handle_wake(serial: Optional[str]) -> Dict[str, Any]:
+    """Wake the screen (no unlock). Idempotent."""
+    _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+         serial=serial, timeout=5)
+    # Verify
+    r_pow = _run(["shell", "dumpsys", "power"], serial=serial, timeout=5)
+    wake_m = _re_lock.search(r"mWakefulness=(\w+)", r_pow["stdout"] or "")
+    awake = wake_m and wake_m.group(1) == "Awake"
+    return _ok(
+        f"⏰ wake: {wake_m.group(1) if wake_m else 'unknown'}",
+        awake=bool(awake),
+        wakefulness=(wake_m.group(1) if wake_m else None),
+    )
+
+
+def _handle_sleep(serial: Optional[str]) -> Dict[str, Any]:
+    """Turn screen off and lock the device."""
+    _run(["shell", "input", "keyevent", "KEYCODE_SLEEP"],
+         serial=serial, timeout=5)
+    # Verify
+    r_pow = _run(["shell", "dumpsys", "power"], serial=serial, timeout=5)
+    wake_m = _re_lock.search(r"mWakefulness=(\w+)", r_pow["stdout"] or "")
+    return _ok(
+        f"😴 sleep: {wake_m.group(1) if wake_m else 'unknown'}",
+        awake=False,
+        wakefulness=(wake_m.group(1) if wake_m else None),
+    )
+
+
+def _handle_keep_awake(
+    keep_awake_enabled: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Toggle Settings.Global.stay_on_while_plugged_in.
+
+    Values: 0=never, 1=AC, 2=USB, 4=Wireless (bitmask). We set to 7 when
+    True (all sources), 0 when False.
+    """
+    value = "7" if keep_awake_enabled else "0"
+    _run(
+        ["shell", "settings", "put", "global",
+         "stay_on_while_plugged_in", value],
+        serial=serial, timeout=5,
+    )
+    r2 = _run(
+        ["shell", "settings", "get", "global",
+         "stay_on_while_plugged_in"],
+        serial=serial, timeout=5,
+    )
+    current = (r2["stdout"] or "").strip()
+    return _ok(
+        f"📺 keep_awake={keep_awake_enabled} (now={current})",
+        keep_awake=keep_awake_enabled,
+        raw_value=current,
+    )
+
+
+def _handle_unlock(
+    pin: Optional[str],
+    serial: Optional[str],
+    max_retries: int = 2,
+) -> Dict[str, Any]:
+    """Unlock the device by entering the PIN.
+
+    State machine:
+      a) Sleeping            → wake first
+      b) Already unlocked    → return success immediately
+      c) AlternateBouncerView (biometric) → tap fingerprint icon → PIN pad
+      d) Swipe-to-unlock keyguard         → swipe up → PIN pad
+      e) PrimaryBouncer (PIN pad)         → tap digits → Enter
+
+    Args:
+        pin: PIN to enter. If None, read from env var ADB_DEVICE_PIN.
+        max_retries: how many times to retry the PIN tap sequence.
+    """
+    import time as _time
+
+    # Resolve PIN: explicit arg > env var
+    if not pin:
+        pin = os.environ.get("ADB_DEVICE_PIN", "")
+    if not pin:
+        return _err(
+            "no PIN supplied. Pass pin='1234' or set ADB_DEVICE_PIN env var."
+        )
+    if not pin.isdigit():
+        return _err(f"PIN must be digits only (got {len(pin)} chars)")
+
+    steps: List[str] = []
+
+    # Step 1: already unlocked?
+    already = _read_device_locked(serial)
+    if already is False:
+        return _ok(
+            "🔓 already unlocked", locked=False, steps=["already_unlocked"],
+        )
+    steps.append(f"initial_locked={already}")
+
+    # Step 2: wake if sleeping
+    r_pow = _run(["shell", "dumpsys", "power"], serial=serial, timeout=5)
+    wake_m = _re_lock.search(r"mWakefulness=(\w+)", r_pow["stdout"] or "")
+    if not wake_m or wake_m.group(1) != "Awake":
+        _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+             serial=serial, timeout=5)
+        _time.sleep(0.4)
+        steps.append("wake")
+
+    # Step 3: reach the PIN pad.
+    # On Pixel 10 Pro / Android 16 the flow is:
+    #   (a) Fresh wake   → NotificationShade hosts the lockscreen face
+    #   (b) wm dismiss-keyguard → switches to AlternateBouncerView (biometric)
+    #   (c) Tap fingerprint icon → PrimaryBouncer with PIN pad appears
+    #
+    # On older devices, step (b) may not be needed, or the PIN pad may
+    # appear directly after (b). We handle all variants with fall-throughs.
+
+    xml = _ui_dump(serial)
+    has_pin_pad = all(
+        _find_node_center(xml, str(d)) is not None for d in "0123456789"
+    )
+
+    if not has_pin_pad:
+        # Step 3a: request keyguard dismissal (forces bouncer view)
+        _run(["shell", "wm", "dismiss-keyguard"], serial=serial, timeout=5)
+        _time.sleep(1.2)
+        steps.append("dismiss_keyguard")
+        xml = _ui_dump(serial)
+        has_pin_pad = all(
+            _find_node_center(xml, str(d)) is not None for d in "0123456789"
+        )
+
+    if not has_pin_pad:
+        # Step 3b: dismiss biometric bouncer by tapping FP sensor
+        fp = _find_node_center(xml, "Fingerprint sensor")
+        if fp:
+            _tap(*fp, serial)
+            _time.sleep(1.2)
+            steps.append(f"tap_fp@{fp}")
+            xml = _ui_dump(serial)
+            has_pin_pad = all(
+                _find_node_center(xml, str(d)) is not None for d in "0123456789"
+            )
+
+    if not has_pin_pad:
+        # Step 3c: legacy swipe-up fallback
+        _run(
+            ["shell", "input", "touchscreen", "swipe",
+             "540", "1800", "540", "600", "300"],
+            serial=serial, timeout=5,
+        )
+        _time.sleep(1.0)
+        steps.append("swipe_up")
+        xml = _ui_dump(serial)
+        has_pin_pad = all(
+            _find_node_center(xml, str(d)) is not None for d in "0123456789"
+        )
+
+    if not has_pin_pad:
+        err = _err(
+            "could not reach PIN pad. UI may have changed or device is in "
+            "an unexpected state."
+        )
+        err["steps"] = steps
+        return err
+
+    # Step 4: enter PIN + tap Enter, with retries
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        # Look up each digit every attempt (positions are stable but dump
+        # could theoretically change). Tap them in order.
+        positions = {d: _find_node_center(xml, d) for d in "0123456789"}
+        enter_pos = _find_node_center(xml, "Enter")
+        delete_pos = _find_node_center(xml, "Delete")
+
+        if not all(positions.values()) or not enter_pos:
+            last_error = f"missing keys (attempt {attempt})"
+            _time.sleep(0.5)
+            xml = _ui_dump(serial)
+            continue
+
+        # Tap each digit
+        for digit in pin:
+            x, y = positions[digit]
+            _tap(x, y, serial)
+            _time.sleep(0.12)
+
+        # Tap Enter
+        _tap(*enter_pos, serial)
+        _time.sleep(1.4)  # give keyguard time to dismiss
+
+        # Verify
+        locked_after = _read_device_locked(serial)
+        steps.append(f"attempt{attempt}: locked_after={locked_after}")
+
+        if locked_after is False:
+            return _ok(
+                f"🔓 unlocked in {attempt} attempt(s) (steps: {len(steps)})",
+                locked=False,
+                attempts=attempt,
+                steps=steps,
+            )
+
+        # Failure: PIN pad may need re-dumping for retry. Tap Delete enough
+        # times to clear, then try again.
+        if delete_pos and attempt < max_retries:
+            for _ in range(len(pin) + 2):
+                _tap(*delete_pos, serial)
+                _time.sleep(0.08)
+            _time.sleep(0.4)
+            xml = _ui_dump(serial)
+            # Re-check it's still a PIN pad
+            if not _find_node_center(xml, "0"):
+                last_error = "PIN pad vanished mid-retry"
+                break
+
+    err = _err(
+        f"unlock failed after {max_retries} attempt(s): {last_error or 'unknown'}"
+    )
+    err["steps"] = steps
+    return err
+
+
+# =============================================================================
 # 🔐  Security & Posture  (Frontier #13)
 # =============================================================================
 #
@@ -5481,6 +5777,8 @@ ACTIONS = {
     # Security (v0.16.0)
     "security_posture", "security_lock",
     "security_biometrics", "security_vpn",
+    # Session lifecycle (v0.17.0)
+    "is_locked", "wake", "sleep", "unlock", "keep_awake",
 }
 
 
@@ -5587,6 +5885,8 @@ def adb(
     sensor_query: Any = None,
     # Power & battery (v0.15.0)
     power_top: int = 20,
+    # Session lifecycle (v0.17.0)  (pin already declared above)
+    keep_awake_enabled: bool = False,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -5617,6 +5917,15 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Session: is_locked → {locked, awake, trust_state, wakefulness}.
+                     wake / sleep → screen on / off (no unlock on wake).
+                     unlock(pin='1234') → wakes, detects bouncer type,
+                     dismisses biometric bouncer by tapping fingerprint
+                     icon, enters PIN via UI taps (works on Android 16 /
+                     AlternateBouncerView), retries on failure. PIN falls
+                     back to ADB_DEVICE_PIN env var if not passed.
+                     keep_awake(keep_awake_enabled=True) → toggles
+                     Settings.Global.stay_on_while_plugged_in.
             Security: security_posture → device-wide snapshot (verified
                       boot, bootloader lock, SELinux, encryption, dev
                       options, ADB, Play Protect). Returns
@@ -5770,10 +6079,7 @@ def adb(
             return _handle_device_info(serial)
         if action == "battery":
             return _handle_battery(serial)
-        if action == "wake":
-            return _handle_wake(serial)
-        if action == "unlock":
-            return _handle_unlock(serial, pin)
+
         if action == "shell":
             return _handle_shell(command or "", serial, timeout)
         if action == "tap":
@@ -6067,6 +6373,18 @@ def adb(
             return _handle_security_biometrics(serial)
         if action == "security_vpn":
             return _handle_security_vpn(serial)
+
+        # Session lifecycle (v0.17.0)
+        if action == "is_locked":
+            return _handle_is_locked(serial)
+        if action == "wake":
+            return _handle_wake(serial)
+        if action == "sleep":
+            return _handle_sleep(serial)
+        if action == "unlock":
+            return _handle_unlock(pin, serial)
+        if action == "keep_awake":
+            return _handle_keep_awake(keep_awake_enabled, serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
