@@ -2285,6 +2285,385 @@ def _handle_gesture_pinch(
     )
 
 
+
+
+# =============================================================================
+# ♿  Accessibility / ATC  (Frontier #8)
+# =============================================================================
+#
+# Accessibility is a first-class Android subsystem that agents can control:
+# TalkBack, captions, magnification, font scale, high contrast, select-to-
+# speak, switch access, and system actions (back/home/notifications/…) all
+# sit behind the Accessibility Manager.
+#
+# APIs used (no root needed):
+#
+#   settings put secure enabled_accessibility_services <comp1:comp2>
+#   settings put secure accessibility_enabled 0|1
+#   settings put secure accessibility_captioning_enabled 0|1
+#   settings put secure accessibility_display_magnification_enabled 0|1
+#   settings put system font_scale <float>
+#   cmd package query-services -a android.accessibilityservice.AccessibilityService
+#   cmd accessibility call-system-action <int>
+#   dumpsys accessibility
+#
+# Known accessibility service packages (Pixel defaults):
+#   com.google.android.marvin.talkback/.TalkBackService         — screen reader
+#   com.google.android.accessibility.switchaccess/…             — switch access
+#   com.google.android.apps.accessibility.voiceaccess/.JustSpeakService — voice
+#   com.google.android.accessibility.soundamplifier/…           — amp
+#   com.android.systemui.accessibility.accessibilitymenu/…      — a11y menu
+#   com.google.audio.hearing.visualization.accessibility.scribe/… — live caption
+#
+# Design: short names → full component paths so callers can say
+#   accessibility_toggle_service(service="talkback", enable=True)
+# and we look up the right ComponentName.
+
+# Short-name → component shortcuts for the common Pixel accessibility apps.
+# The actual full component name is looked up at runtime because some OEM
+# ROMs use slightly different class names.
+A11Y_SERVICE_ALIASES = {
+    "talkback":      "com.google.android.marvin.talkback",
+    "switchaccess":  "com.google.android.accessibility.switchaccess",
+    "voiceaccess":   "com.google.android.apps.accessibility.voiceaccess",
+    "soundamp":      "com.google.android.accessibility.soundamplifier",
+    "a11ymenu":      "com.android.systemui.accessibility.accessibilitymenu",
+    "selecttospeak": "com.google.android.marvin.talkback",  # bundled in TB pkg
+    "livecaption":   "com.google.audio.hearing.visualization.accessibility.scribe",
+    "scribe":        "com.google.audio.hearing.visualization.accessibility.scribe",
+}
+
+# Global system actions — these IDs are defined in
+# android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_*
+# (public API, stable across Android versions since API 16-31).
+A11Y_SYSTEM_ACTIONS = {
+    "back":               1,
+    "home":               2,
+    "notifications":      3,
+    "recents":            4,
+    "quick_settings":     5,
+    "power_dialog":       6,
+    "toggle_split_screen": 7,
+    "lock_screen":        8,
+    "screenshot":         9,
+    "accessibility_button": 11,
+    "accessibility_button_chooser": 12,
+    "accessibility_shortcut": 13,
+    "dpad_up":            16,
+    "dpad_down":          17,
+    "dpad_left":          18,
+    "dpad_right":         19,
+    "dpad_center":        20,
+    "menu":               21,
+    "media_play_pause":   22,
+}
+
+
+def _a11y_list_installed_services(serial: Optional[str]) -> List[Dict[str, str]]:
+    """Scan installed accessibility services via `cmd package query-services`.
+
+    The output groups info as `Service #N:` blocks, each containing a
+    `ServiceInfo:` section followed by an `ApplicationInfo:` section.
+    Both sections have `name=` and `packageName=` fields, so we must:
+      1. anchor on `Service #` as block boundary
+      2. only capture the FIRST name= / packageName= after each block header
+         (which live in the ServiceInfo section)
+
+    Returns list of {package, component, name} dicts.
+    """
+    r = _run(
+        ["shell", "cmd", "package", "query-services", "-a",
+         "android.accessibilityservice.AccessibilityService"],
+        serial=serial, timeout=15,
+    )
+    if r["returncode"] != 0:
+        return []
+
+    services: List[Dict[str, str]] = []
+    cur_pkg: Optional[str] = None
+    cur_name: Optional[str] = None
+    in_service_info = False
+
+    for raw in (r["stdout"] or "").splitlines():
+        line = raw.strip()
+
+        # Start of a new service block — flush previous, reset state
+        if line.startswith("Service #"):
+            if cur_pkg and cur_name:
+                services.append({
+                    "package": cur_pkg,
+                    "name": cur_name,
+                    "component": f"{cur_pkg}/{cur_name}",
+                })
+            cur_pkg = cur_name = None
+            in_service_info = False
+            continue
+
+        if line == "ServiceInfo:":
+            in_service_info = True
+            continue
+
+        # Once we hit ApplicationInfo, stop capturing (its name/pkg overrides)
+        if line == "ApplicationInfo:":
+            in_service_info = False
+            continue
+
+        if in_service_info:
+            if cur_name is None and line.startswith("name="):
+                cur_name = line.split("=", 1)[1].strip()
+            elif cur_pkg is None and line.startswith("packageName="):
+                cur_pkg = line.split("=", 1)[1].strip()
+
+    # Flush final block
+    if cur_pkg and cur_name:
+        services.append({
+            "package": cur_pkg,
+            "name": cur_name,
+            "component": f"{cur_pkg}/{cur_name}",
+        })
+
+    return services
+
+
+def _a11y_resolve_component(
+    service: str, serial: Optional[str]
+) -> Optional[str]:
+    """Resolve a short name or package to full `pkg/cls` ComponentName.
+
+    Accepts:
+      - full component "pkg/cls" → returned verbatim
+      - package name "com.foo.bar" → looked up in installed services
+      - short alias "talkback" → resolved via A11Y_SERVICE_ALIASES then lookup
+    """
+    if "/" in service:
+        return service
+
+    pkg = A11Y_SERVICE_ALIASES.get(service.lower(), service)
+    installed = _a11y_list_installed_services(serial)
+    # Prefer exact package match
+    for svc in installed:
+        if svc["package"] == pkg:
+            return svc["component"]
+    # Fallback: substring match
+    for svc in installed:
+        if service.lower() in svc["package"].lower():
+            return svc["component"]
+    return None
+
+
+def _a11y_get_enabled(serial: Optional[str]) -> List[str]:
+    """Current enabled_accessibility_services as list of components."""
+    r = _run(
+        ["shell", "settings", "get", "secure", "enabled_accessibility_services"],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return []
+    raw = (r["stdout"] or "").strip()
+    if raw in ("", "null"):
+        return []
+    return [c for c in raw.split(":") if c]
+
+
+def _a11y_set_enabled(
+    components: List[str], serial: Optional[str]
+) -> Dict[str, Any]:
+    """Write the full enabled_accessibility_services list atomically."""
+    value = ":".join(components) if components else '""'
+    r = _run(
+        ["shell", "settings", "put", "secure",
+         "enabled_accessibility_services", value],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return {"ok": False, "error": r["stderr"] or "put failed"}
+
+    # Also toggle master accessibility_enabled flag to match
+    master = "1" if components else "0"
+    _run(
+        ["shell", "settings", "put", "secure", "accessibility_enabled", master],
+        serial=serial, timeout=5,
+    )
+    return {"ok": True}
+
+
+def _handle_accessibility_list(serial: Optional[str]) -> Dict[str, Any]:
+    """List all installed accessibility services + enabled state."""
+    installed = _a11y_list_installed_services(serial)
+    enabled = set(_a11y_get_enabled(serial))
+
+    lines = [f"♿ {len(installed)} installed, {len(enabled)} enabled:"]
+    for svc in installed:
+        mark = "✅" if svc["component"] in enabled else "  "
+        lines.append(f"  {mark} {svc['component']}")
+
+    if enabled:
+        lines.append("")
+        lines.append("Enabled components not in installed list:")
+        unknown = enabled - {s["component"] for s in installed}
+        for u in unknown:
+            lines.append(f"     ⚠ {u}")
+
+    return _ok(
+        "\n".join(lines),
+        installed=installed,
+        enabled=sorted(enabled),
+        installed_count=len(installed),
+        enabled_count=len(enabled),
+    )
+
+
+def _handle_accessibility_toggle_service(
+    service: str, enable: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Enable/disable a single accessibility service by name or component."""
+    if not service:
+        return _err("service name required (e.g. 'talkback' or 'pkg/cls')")
+
+    component = _a11y_resolve_component(service, serial)
+    if component is None:
+        aliases = ", ".join(sorted(A11Y_SERVICE_ALIASES.keys()))
+        return _err(
+            f"could not resolve accessibility service '{service}'. "
+            f"Known aliases: {aliases}. "
+            f"Or pass a full 'package/class' component name. "
+            f"Use action='accessibility_list' to see installed services."
+        )
+
+    enabled = _a11y_get_enabled(serial)
+    changed = False
+    if enable:
+        if component not in enabled:
+            enabled.append(component)
+            changed = True
+    else:
+        if component in enabled:
+            enabled.remove(component)
+            changed = True
+
+    if not changed:
+        state = "already enabled" if enable else "already disabled"
+        return _ok(f"♿ {component} {state}", component=component, changed=False)
+
+    result = _a11y_set_enabled(enabled, serial)
+    if not result["ok"]:
+        return _err(f"failed to update enabled services: {result.get('error')}")
+
+    verb = "enabled" if enable else "disabled"
+    return _ok(
+        f"♿ {verb} {component}",
+        component=component,
+        changed=True,
+        enabled_services=enabled,
+    )
+
+
+def _handle_accessibility_system_action(
+    action: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Call a global system accessibility action by name or numeric id."""
+    if not action:
+        names = ", ".join(sorted(A11Y_SYSTEM_ACTIONS.keys()))
+        return _err(f"system_action name required. Options: {names}")
+
+    # Support either name or numeric id
+    if action.isdigit():
+        action_id = int(action)
+        action_name = f"id_{action_id}"
+    else:
+        key = action.lower()
+        if key not in A11Y_SYSTEM_ACTIONS:
+            names = ", ".join(sorted(A11Y_SYSTEM_ACTIONS.keys()))
+            return _err(f"unknown system action '{action}'. Valid: {names}")
+        action_id = A11Y_SYSTEM_ACTIONS[key]
+        action_name = key
+
+    r = _run(
+        ["shell", "cmd", "accessibility", "call-system-action", str(action_id)],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"call-system-action failed: {r['stderr'][:100]}")
+
+    return _ok(
+        f"♿ system action '{action_name}' (id={action_id}) invoked",
+        action=action_name,
+        action_id=action_id,
+    )
+
+
+def _handle_accessibility_captions(
+    enable: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Toggle system captioning (shows captions in media apps that opt in)."""
+    value = "1" if enable else "0"
+    r = _run(
+        ["shell", "settings", "put", "secure",
+         "accessibility_captioning_enabled", value],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"failed: {r['stderr'][:100]}")
+    verb = "enabled" if enable else "disabled"
+    return _ok(f"♿ system captions {verb}", enabled=enable)
+
+
+def _handle_accessibility_magnification(
+    enable: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Toggle display magnification."""
+    value = "1" if enable else "0"
+    r = _run(
+        ["shell", "settings", "put", "secure",
+         "accessibility_display_magnification_enabled", value],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"failed: {r['stderr'][:100]}")
+    verb = "enabled" if enable else "disabled"
+    return _ok(f"♿ display magnification {verb}", enabled=enable)
+
+
+def _handle_accessibility_font_scale(
+    scale: float, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Set system font scale. 1.0=normal; 0.85=small; 1.15=large; 1.3=larger;
+    1.5=largest; 2.0=massive. Non-integer multiples allowed."""
+    if scale < 0.5 or scale > 3.0:
+        return _err("font_scale must be 0.5..3.0")
+    r = _run(
+        ["shell", "settings", "put", "system", "font_scale", str(scale)],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"failed: {r['stderr'][:100]}")
+    return _ok(f"♿ font_scale → {scale}", font_scale=scale)
+
+
+def _handle_accessibility_status(serial: Optional[str]) -> Dict[str, Any]:
+    """Snapshot of the accessibility subsystem for agent overview."""
+    def _get(ns, key):
+        r = _run(["shell", "settings", "get", ns, key],
+                 serial=serial, timeout=5)
+        return (r["stdout"] or "").strip() if r["returncode"] == 0 else None
+
+    status = {
+        "accessibility_enabled":     _get("secure", "accessibility_enabled"),
+        "enabled_services":          _get("secure", "enabled_accessibility_services"),
+        "captioning_enabled":        _get("secure", "accessibility_captioning_enabled"),
+        "magnification_enabled":     _get("secure", "accessibility_display_magnification_enabled"),
+        "font_scale":                _get("system", "font_scale"),
+        "touch_exploration":         _get("secure", "touch_exploration_enabled"),
+        "high_text_contrast":        _get("secure", "high_text_contrast_enabled"),
+        "color_inversion":           _get("secure", "accessibility_display_inversion_enabled"),
+    }
+    lines = ["♿ Accessibility status:"]
+    for k, v in status.items():
+        display = "—" if v in (None, "", "null") else v
+        lines.append(f"  {k:28s}: {display}")
+    return _ok("\n".join(lines), **{k: v for k, v in status.items()})
+
+
 ACTIONS = {
     # device
     "list_devices", "select_device", "device_info", "battery", "wake", "unlock",
@@ -2324,6 +2703,11 @@ ACTIONS = {
     "screen_frames", "video_frames",
     # Gesture streaming (v0.9.0)
     "gesture_stream", "gesture_long_press", "gesture_path", "gesture_pinch",
+    # Accessibility / ATC (v0.10.0)
+    "accessibility_list", "accessibility_toggle_service",
+    "accessibility_system_action", "accessibility_captions",
+    "accessibility_magnification", "accessibility_font_scale",
+    "accessibility_status",
 }
 
 
@@ -2396,6 +2780,11 @@ def adb(
     gesture_shape: str = "line_h",
     gesture_size: int = 300,
     gesture_steps: int = 20,
+    # Accessibility / ATC (v0.10.0)
+    a11y_service: Optional[str] = None,
+    a11y_enable: bool = True,
+    a11y_system_action: Optional[str] = None,
+    a11y_font_scale: float = 1.0,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -2426,6 +2815,16 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            A11y:    accessibility_list → installed + enabled services.
+                     accessibility_toggle_service (a11y_service='talkback',
+                     a11y_enable=True) → toggle by alias or full component.
+                     accessibility_system_action (a11y_system_action='home'|
+                     'back'|'notifications'|'recents'|'quick_settings'|'power_dialog'|
+                     'screenshot'|'lock_screen'|…) → invoke global system action.
+                     accessibility_captions (a11y_enable=bool) → system captions.
+                     accessibility_magnification (a11y_enable=bool) → zoom.
+                     accessibility_font_scale (a11y_font_scale=1.3) → text size.
+                     accessibility_status → snapshot of all a11y settings.
             Gesture: gesture_stream (gesture_points=[[x,y],...], gesture_step_delay_ms=30)
                      → streams motionevent DOWN, N×MOVE, UP. Arbitrary paths.
                      gesture_long_press (x, y, gesture_hold_ms=500)
@@ -2675,6 +3074,26 @@ def adb(
             if x is None or y is None:
                 return _err("gesture_pinch requires x, y (pinch center)")
             return _handle_gesture_pinch(x, y, gesture_size, gesture_shape, serial)
+
+        # Accessibility / ATC (v0.10.0)
+        if action == "accessibility_list":
+            return _handle_accessibility_list(serial)
+        if action == "accessibility_toggle_service":
+            if not a11y_service:
+                return _err("accessibility_toggle_service requires a11y_service=<name|component>")
+            return _handle_accessibility_toggle_service(
+                a11y_service, a11y_enable, serial,
+            )
+        if action == "accessibility_system_action":
+            return _handle_accessibility_system_action(a11y_system_action, serial)
+        if action == "accessibility_captions":
+            return _handle_accessibility_captions(a11y_enable, serial)
+        if action == "accessibility_magnification":
+            return _handle_accessibility_magnification(a11y_enable, serial)
+        if action == "accessibility_font_scale":
+            return _handle_accessibility_font_scale(a11y_font_scale, serial)
+        if action == "accessibility_status":
+            return _handle_accessibility_status(serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
