@@ -29,6 +29,14 @@ from typing import Any, Dict, List, Optional
 
 from strands import tool
 
+# Path-safe import so the tool works both when installed AND when loaded
+# as a raw file via manage_tools.add(/path/to/adb_tool.py)
+import sys as _sys
+_here = str(Path(__file__).resolve().parent.parent)
+if _here not in _sys.path:
+    _sys.path.insert(0, _here)
+from strands_adb import smart  # noqa: E402
+
 logger = logging.getLogger("strands_adb")
 
 # ----------------------------------------------------------------------------
@@ -447,6 +455,235 @@ def _handle_logcat(
 
 
 # ----------------------------------------------------------------------------
+# Smart handlers (semantic layer)
+# ----------------------------------------------------------------------------
+
+
+def _handle_notifications_parsed(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(["shell", "dumpsys", "notification", "--noredact"], serial=serial, timeout=30)
+    parsed = smart.parse_notifications(r["stdout"])
+    lines = [
+        f"📬 {len(parsed)} notifications:",
+        *[
+            f"  • [{n['pkg'].split('.')[-1]}] {n['title']}"
+            + (f" — {n['text'][:100]}" if n["text"] else "")
+            for n in parsed[:30]
+        ],
+    ]
+    return _ok("\n".join(lines), notifications=parsed)
+
+
+def _handle_ui_find(
+    serial: Optional[str],
+    text: Optional[str],
+    desc: Optional[str],
+    resource_id: Optional[str],
+) -> Dict[str, Any]:
+    _run(["shell", "uiautomator", "dump", "/sdcard/_ui.xml"], serial=serial, timeout=30)
+    r = _run(["shell", "cat", "/sdcard/_ui.xml"], serial=serial, timeout=30)
+    _run(["shell", "rm", "/sdcard/_ui.xml"], serial=serial)
+    elements = smart.parse_ui_dump(r["stdout"])
+    if not any([text, desc, resource_id]):
+        return _ok(
+            f"{len(elements)} interactable elements on screen",
+            elements=elements,
+        )
+    found = smart.find_element(
+        elements, text=text, desc=desc, resource_id=resource_id
+    )
+    if not found:
+        return _err(
+            f"no element found matching text={text!r} desc={desc!r} id={resource_id!r}"
+        )
+    return _ok(
+        f"found: {found['text'] or found['desc'] or found['resource_id']}\n"
+        f"  class: {found['class']}\n"
+        f"  bounds: ({found['bounds']['x1']},{found['bounds']['y1']}) "
+        f"→ ({found['bounds']['x2']},{found['bounds']['y2']})\n"
+        f"  center: ({found['bounds']['cx']}, {found['bounds']['cy']})",
+        element=found,
+    )
+
+
+def _handle_smart_tap(
+    serial: Optional[str],
+    text: Optional[str],
+    desc: Optional[str],
+    resource_id: Optional[str],
+) -> Dict[str, Any]:
+    if not any([text, desc, resource_id]):
+        return _err("smart_tap requires one of text, desc, or resource_id")
+    _run(["shell", "uiautomator", "dump", "/sdcard/_ui.xml"], serial=serial, timeout=30)
+    r = _run(["shell", "cat", "/sdcard/_ui.xml"], serial=serial, timeout=30)
+    _run(["shell", "rm", "/sdcard/_ui.xml"], serial=serial)
+    elements = smart.parse_ui_dump(r["stdout"])
+    found = smart.find_element(
+        elements, text=text, desc=desc, resource_id=resource_id
+    )
+    if not found:
+        return _err(
+            f"no clickable element found matching text={text!r} "
+            f"desc={desc!r} id={resource_id!r}"
+        )
+    b = found["bounds"]
+    _run(["shell", "input", "tap", str(b["cx"]), str(b["cy"])], serial=serial)
+    label = found["text"] or found["desc"] or found["resource_id"]
+    return _ok(f"smart-tapped '{label}' at ({b['cx']}, {b['cy']})", element=found)
+
+
+def _handle_sensors(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(["shell", "dumpsys", "sensorservice"], serial=serial, timeout=30)
+    sensors = smart.list_sensors(r["stdout"])
+    last_vals = smart.parse_sensor_last_values(r["stdout"])
+    # Join: attach last values to sensors by name match
+    for s in sensors:
+        for k, v in last_vals.items():
+            if s["name"].startswith(k) or k.startswith(s["name"]):
+                s["last_values"] = v
+                break
+    lines = [f"🌡️ {len(sensors)} sensors:"]
+    for s in sensors[:25]:
+        vals = s.get("last_values")
+        suffix = f" = {vals}" if vals else ""
+        lines.append(f"  • {s['name']} ({s['vendor']}){suffix}")
+    return _ok("\n".join(lines), sensors=sensors)
+
+
+def _handle_thermals(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(["shell", "dumpsys", "thermalservice"], serial=serial, timeout=30)
+    temps = smart.parse_thermals(r["stdout"])
+    # Sort by value desc
+    temps.sort(key=lambda t: t["value"], reverse=True)
+    lines = [f"🌡️ {len(temps)} thermal zones (hottest first):"]
+    for t in temps[:20]:
+        status = " ⚠️" if t["status"] > 0 else ""
+        lines.append(f"  • {t['name']}: {t['value']:.1f}°{status}")
+    return _ok("\n".join(lines), thermals=temps)
+
+
+def _handle_wifi_info(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(["shell", "cmd", "wifi", "status"], serial=serial, timeout=10)
+    info = smart.parse_wifi(r["stdout"])
+    if not info.get("connected"):
+        return _ok("wifi: not connected", wifi=info)
+    return _ok(
+        f"📶 wifi: {info['ssid']} ({info['rssi']} dBm, "
+        f"{info['link_speed_mbps']} Mbps @ {info['frequency_mhz']} MHz)\n"
+        f"  IP: {info['ip']}   BSSID: {info['bssid']}",
+        wifi=info,
+    )
+
+
+def _handle_screen_record(
+    duration_sec: int,
+    output_path: Optional[str],
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """Record the screen for duration_sec seconds, pull mp4."""
+    if duration_sec > 180:
+        return _err("max duration is 180s (Android limit)")
+    remote = f"/sdcard/_rec_{int(time.time())}.mp4"
+    local = Path(output_path) if output_path else Path(
+        f"/tmp/adb_rec_{int(time.time())}.mp4"
+    )
+    local.parent.mkdir(parents=True, exist_ok=True)
+    # Run screenrecord in background
+    cmd_bg = [_adb_bin()]
+    s = serial or _SELECTED_SERIAL
+    if s:
+        cmd_bg += ["-s", s]
+    cmd_bg += ["shell", f"screenrecord --time-limit {duration_sec} {remote}"]
+    try:
+        subprocess.run(cmd_bg, capture_output=True, timeout=duration_sec + 10)
+    except subprocess.TimeoutExpired:
+        return _err("screen record timed out")
+    # Small delay so file finalizes
+    time.sleep(0.5)
+    r = _run(["pull", remote, str(local)], serial=serial, timeout=60)
+    _run(["shell", "rm", remote], serial=serial)
+    if r["returncode"] != 0 or not local.exists():
+        return _err(f"pull failed: {r['stderr']}")
+    return _ok(
+        f"🎬 recorded {duration_sec}s → {local} ({local.stat().st_size} bytes)",
+        path=str(local),
+        size_bytes=local.stat().st_size,
+    )
+
+
+def _handle_dial(phone: str, call: bool, serial: Optional[str]) -> Dict[str, Any]:
+    """Open dialer with number (call=False) or actually place the call (call=True)."""
+    if not phone:
+        return _err("phone number required")
+    # Sanitize: only digits, +, *, #
+    clean = re.sub(r"[^+\d*#]", "", phone)
+    if not clean:
+        return _err("invalid phone number")
+    action = "android.intent.action.CALL" if call else "android.intent.action.DIAL"
+    _run(
+        ["shell", "am", "start", "-a", action, "-d", f"tel:{clean}"],
+        serial=serial,
+    )
+    verb = "placed call to" if call else "opened dialer for"
+    return _ok(f"{verb} {clean}")
+
+
+def _handle_sms_compose(
+    phone: str, text: str, send: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Open default SMS app with pre-filled message.
+
+    send=True is intentionally NOT supported — Android prevents this
+    without the app being the default SMS handler (security by design).
+    User must tap Send.
+    """
+    if send:
+        return _err(
+            "sending SMS programmatically requires default-SMS-app status; "
+            "use send=False to draft and let user tap Send"
+        )
+    if not phone:
+        return _err("phone number required")
+    clean = re.sub(r"[^+\d*#]", "", phone)
+    args = ["shell", "am", "start", "-a", "android.intent.action.SENDTO",
+            "-d", f"sms:{clean}"]
+    if text:
+        args += ["--es", "sms_body", text]
+    _run(args, serial=serial)
+    return _ok(f"📩 drafted SMS to {clean}: {text[:60]}")
+
+
+def _handle_media_control(action: str, serial: Optional[str]) -> Dict[str, Any]:
+    """Media key events: play, pause, play_pause, next, previous, stop."""
+    keymap = {
+        "play": "KEYCODE_MEDIA_PLAY",
+        "pause": "KEYCODE_MEDIA_PAUSE",
+        "play_pause": "KEYCODE_MEDIA_PLAY_PAUSE",
+        "next": "KEYCODE_MEDIA_NEXT",
+        "previous": "KEYCODE_MEDIA_PREVIOUS",
+        "stop": "KEYCODE_MEDIA_STOP",
+        "rewind": "KEYCODE_MEDIA_REWIND",
+        "fast_forward": "KEYCODE_MEDIA_FAST_FORWARD",
+    }
+    kc = keymap.get(action.lower())
+    if not kc:
+        return _err(f"unknown media action: {action}. Valid: {list(keymap)}")
+    _run(["shell", "input", "keyevent", kc], serial=serial)
+    return _ok(f"media: {action}")
+
+
+def _handle_volume(
+    stream: str, direction: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Volume control. direction: up, down, mute."""
+    keymap = {"up": "KEYCODE_VOLUME_UP", "down": "KEYCODE_VOLUME_DOWN", "mute": "KEYCODE_VOLUME_MUTE"}
+    kc = keymap.get(direction.lower())
+    if not kc:
+        return _err(f"direction must be up|down|mute, got {direction}")
+    _run(["shell", "input", "keyevent", kc], serial=serial)
+    return _ok(f"volume {direction}")
+
+
+# ----------------------------------------------------------------------------
 # The @tool
 # ----------------------------------------------------------------------------
 
@@ -470,6 +707,11 @@ ACTIONS = {
     "notifications",
     # logs
     "logcat",
+    # smart layer
+    "notifications_parsed", "ui_find", "smart_tap",
+    "sensors", "thermals", "wifi_info",
+    # media + comms
+    "screen_record", "dial", "sms_compose", "media", "volume",
 }
 
 
@@ -501,6 +743,18 @@ def adb(
     lines: int = 200,
     pin: Optional[str] = None,
     timeout: int = 30,
+    # Smart UI
+    resource_id: Optional[str] = None,
+    desc_filter: Optional[str] = None,
+    # Dial / SMS
+    phone: Optional[str] = None,
+    call_now: bool = False,
+    send: bool = False,
+    # Media
+    media_action: Optional[str] = None,
+    volume_direction: Optional[str] = None,
+    # Screen record
+    duration_sec: int = 10,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -636,6 +890,30 @@ def adb(
             return _handle_notifications(serial)
         if action == "logcat":
             return _handle_logcat(filter_text, lines, serial)
+
+        # --- Smart layer ---
+        if action == "notifications_parsed":
+            return _handle_notifications_parsed(serial)
+        if action == "ui_find":
+            return _handle_ui_find(serial, text, desc_filter, resource_id)
+        if action == "smart_tap":
+            return _handle_smart_tap(serial, text, desc_filter, resource_id)
+        if action == "sensors":
+            return _handle_sensors(serial)
+        if action == "thermals":
+            return _handle_thermals(serial)
+        if action == "wifi_info":
+            return _handle_wifi_info(serial)
+        if action == "screen_record":
+            return _handle_screen_record(duration_sec, output_path, serial)
+        if action == "dial":
+            return _handle_dial(phone or "", call_now, serial)
+        if action == "sms_compose":
+            return _handle_sms_compose(phone or "", text or "", send, serial)
+        if action == "media":
+            return _handle_media_control(media_action or "", serial)
+        if action == "volume":
+            return _handle_volume("", volume_direction or "", serial)
 
         return _err(f"action not implemented: {action}")
     except ADBError as e:
