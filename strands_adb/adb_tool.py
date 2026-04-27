@@ -19,6 +19,7 @@ Actions grouped by domain:
 from __future__ import annotations
 
 import base64
+import re
 import logging
 import os
 import shlex
@@ -300,6 +301,278 @@ def _handle_screenshot(
     }
     if return_base64:
         payload["base64"] = base64.b64encode(png_bytes).decode()
+    return payload
+
+
+
+
+# =============================================================================
+# 📸  Physical Camera  (Frontier #5)
+# =============================================================================
+#
+# Strategy: launch GoogleCamera via STILL_IMAGE_CAMERA intent, then tap the
+# shutter by resource-id (stable across camera modes / Android versions —
+# Google keeps `com.google.android.GoogleCamera:id/shutter_button`).
+#
+# For "Night Sight" mode the shutter stays pressed ~3s; we poll DCIM for a
+# new file with a sensible timeout and pull it back to the host.
+
+_CAMERA_PKG = "com.google.android.GoogleCamera"
+_CAMERA_INTENT_STILL = "android.media.action.STILL_IMAGE_CAMERA"
+_CAMERA_INTENT_VIDEO = "android.media.action.VIDEO_CAMERA"
+
+
+def _latest_dcim_file(
+    serial: Optional[str], extensions: tuple = (".jpg", ".jpeg", ".png", ".mp4")
+) -> Optional[str]:
+    """Return absolute path on device of newest file in DCIM/Camera matching ext."""
+    r = _run(
+        ["shell", "ls", "-t", "/sdcard/DCIM/Camera/"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return None
+    for line in r["stdout"].splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if name.lower().endswith(extensions):
+            return f"/sdcard/DCIM/Camera/{name}"
+    return None
+
+
+def _tap_by_resource_id(resource_id: str, serial: Optional[str]) -> bool:
+    """Dump UI, find bounds for resource-id, tap center. Returns True on hit."""
+    dump = _run(["shell", "uiautomator", "dump", "/sdcard/_cam_ui.xml"],
+                serial=serial, timeout=10)
+    if dump["returncode"] != 0:
+        return False
+    pull = _run(["shell", "cat", "/sdcard/_cam_ui.xml"], serial=serial, timeout=10)
+    xml = pull["stdout"]
+    _run(["shell", "rm", "/sdcard/_cam_ui.xml"], serial=serial, timeout=5)
+    m = re.search(
+        rf'<node[^>]*resource-id="{re.escape(resource_id)}"[^/]*/>', xml
+    )
+    if not m:
+        return False
+    b = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', m.group(0))
+    if not b:
+        return False
+    x1, y1, x2, y2 = map(int, b.groups())
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    r = _run(["shell", "input", "tap", str(cx), str(cy)],
+             serial=serial, timeout=5)
+    return r["returncode"] == 0
+
+
+def _tap_by_content_desc(desc: str, serial: Optional[str]) -> bool:
+    """Tap a UI element by its content-desc attribute."""
+    dump = _run(["shell", "uiautomator", "dump", "/sdcard/_cam_ui.xml"],
+                serial=serial, timeout=10)
+    if dump["returncode"] != 0:
+        return False
+    pull = _run(["shell", "cat", "/sdcard/_cam_ui.xml"], serial=serial, timeout=10)
+    xml = pull["stdout"]
+    _run(["shell", "rm", "/sdcard/_cam_ui.xml"], serial=serial, timeout=5)
+    m = re.search(
+        rf'<node[^>]*content-desc="{re.escape(desc)}"[^/]*/>', xml
+    )
+    if not m:
+        return False
+    b = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', m.group(0))
+    if not b:
+        return False
+    x1, y1, x2, y2 = map(int, b.groups())
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    r = _run(["shell", "input", "tap", str(cx), str(cy)],
+             serial=serial, timeout=5)
+    return r["returncode"] == 0
+
+
+def _handle_camera_photo(
+    output_path: Optional[str],
+    serial: Optional[str],
+    facing: str,
+    auto_pull: bool,
+    include_image: bool,
+    return_base64: bool,
+    timeout_sec: int,
+) -> Dict[str, Any]:
+    """Take a still photo using GoogleCamera. Returns image block for the agent."""
+    # 1. Record baseline — what's currently the newest photo?
+    baseline = _latest_dcim_file(serial, extensions=(".jpg", ".jpeg", ".png"))
+
+    # 2. Wake the device
+    _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial, timeout=5)
+    time.sleep(0.3)
+
+    # 3. Launch camera via intent
+    r = _run(
+        ["shell", "am", "start", "-a", _CAMERA_INTENT_STILL],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"camera intent failed: {r['stderr'][:200]}")
+
+    # Wait for Camera to focus + render viewfinder
+    time.sleep(2.0)
+
+    # 4. Optionally toggle to front camera
+    if facing == "front":
+        if not _tap_by_content_desc("Switch to front camera", serial):
+            logger.debug("front-camera toggle not found (maybe already front)")
+        time.sleep(2.5)  # front viewfinder + UI relayout
+
+    # 5. Tap shutter by resource-id (robust across modes). Retry a few times
+    #    because after a mode switch the UI tree can still be animating.
+    tapped = False
+    for attempt in range(3):
+        if _tap_by_resource_id(
+            "com.google.android.GoogleCamera:id/shutter_button", serial
+        ):
+            tapped = True
+            break
+        time.sleep(0.8)
+    if not tapped:
+        # Fallback: try content-desc variants
+        for desc in ("Take photo", "Take Night Sight photo",
+                     "Take Portrait photo", "Shutter"):
+            if _tap_by_content_desc(desc, serial):
+                tapped = True
+                break
+    if not tapped:
+        return _err("could not find shutter button in GoogleCamera UI")
+
+    # 6. Poll DCIM for a new file (Night Sight can take 3-5s)
+    deadline = time.time() + timeout_sec
+    new_file = None
+    while time.time() < deadline:
+        time.sleep(0.5)
+        latest = _latest_dcim_file(serial, extensions=(".jpg", ".jpeg", ".png"))
+        if latest and latest != baseline:
+            new_file = latest
+            break
+    if not new_file:
+        return _err(
+            f"no new photo appeared in /sdcard/DCIM/Camera within "
+            f"{timeout_sec}s (baseline was {baseline})"
+        )
+
+    # 7. Pull it to host (unless caller opts out)
+    payload: Dict[str, Any] = {
+        "status": "success",
+        "device_path": new_file,
+        "facing": facing,
+    }
+
+    if not auto_pull:
+        payload["content"] = [{"text": f"photo captured on device: {new_file}"}]
+        return payload
+
+    name = new_file.rsplit("/", 1)[-1]
+    local = Path(output_path) if output_path else Path(f"/tmp/{name}")
+    local.parent.mkdir(parents=True, exist_ok=True)
+    pull = _run(["pull", new_file, str(local)], serial=serial, timeout=30)
+    if pull["returncode"] != 0 or not local.exists():
+        return _err(f"pull failed: {pull['stderr'][:200]}")
+
+    img_bytes = local.read_bytes()
+    size = len(img_bytes)
+    summary = f"📸 photo captured → {local} ({size} bytes, facing={facing})"
+    content: List[Dict[str, Any]] = [{"text": summary}]
+
+    if include_image:
+        # Converse image block — same pattern as screenshot.
+        fmt = "jpeg" if name.lower().endswith((".jpg", ".jpeg")) else "png"
+        content.append(
+            {"image": {"format": fmt, "source": {"bytes": img_bytes}}}
+        )
+
+    payload["content"] = content
+    payload["path"] = str(local)
+    payload["size_bytes"] = size
+    if return_base64:
+        payload["base64"] = base64.b64encode(img_bytes).decode()
+    return payload
+
+
+def _handle_camera_video(
+    duration_sec: int,
+    output_path: Optional[str],
+    serial: Optional[str],
+    facing: str,
+    auto_pull: bool,
+) -> Dict[str, Any]:
+    """Record a short video via GoogleCamera.
+
+    We launch the Video intent, tap the record button (reuses shutter_button
+    resource-id in video mode), wait ``duration_sec``, then tap again to
+    stop. Finally pull the mp4.
+    """
+    baseline = _latest_dcim_file(serial, extensions=(".mp4",))
+
+    _run(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial, timeout=5)
+    time.sleep(0.3)
+
+    r = _run(
+        ["shell", "am", "start", "-a", _CAMERA_INTENT_VIDEO],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"video intent failed: {r['stderr'][:200]}")
+    time.sleep(2.0)
+
+    if facing == "front":
+        _tap_by_content_desc("Switch to front camera", serial)
+        time.sleep(1.2)
+
+    # Start recording (video-mode shutter is same resource-id)
+    if not _tap_by_resource_id(
+        "com.google.android.GoogleCamera:id/shutter_button", serial
+    ):
+        return _err("couldn't start video recording (shutter not found)")
+
+    time.sleep(max(1, duration_sec))
+
+    # Stop recording
+    _tap_by_resource_id(
+        "com.google.android.GoogleCamera:id/shutter_button", serial
+    )
+    time.sleep(2.0)  # let encoder finalise
+
+    # Find new mp4
+    deadline = time.time() + 30
+    new_file = None
+    while time.time() < deadline:
+        time.sleep(0.5)
+        latest = _latest_dcim_file(serial, extensions=(".mp4",))
+        if latest and latest != baseline:
+            new_file = latest
+            break
+    if not new_file:
+        return _err("no new video appeared in DCIM")
+
+    payload: Dict[str, Any] = {
+        "status": "success",
+        "device_path": new_file,
+        "duration_sec": duration_sec,
+        "facing": facing,
+    }
+    if not auto_pull:
+        payload["content"] = [{"text": f"video recorded on device: {new_file}"}]
+        return payload
+
+    name = new_file.rsplit("/", 1)[-1]
+    local = Path(output_path) if output_path else Path(f"/tmp/{name}")
+    local.parent.mkdir(parents=True, exist_ok=True)
+    pull = _run(["pull", new_file, str(local)], serial=serial, timeout=60)
+    if pull["returncode"] != 0 or not local.exists():
+        return _err(f"video pull failed: {pull['stderr'][:200]}")
+
+    size = local.stat().st_size
+    payload["content"] = [{"text": f"🎥 video captured → {local} ({size} bytes)"}]
+    payload["path"] = str(local)
+    payload["size_bytes"] = size
     return payload
 
 
@@ -712,6 +985,8 @@ ACTIONS = {
     "sensors", "thermals", "wifi_info",
     # media + comms
     "screen_record", "dial", "sms_compose", "media", "volume",
+    # camera (v0.4.0)
+    "camera_photo", "camera_video",
 }
 
 
@@ -755,6 +1030,10 @@ def adb(
     volume_direction: Optional[str] = None,
     # Screen record
     duration_sec: int = 10,
+    # Camera (v0.4.0)
+    facing: str = "back",
+    auto_pull: bool = True,
+    camera_timeout: int = 15,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -781,6 +1060,8 @@ def adb(
                      start_activity (component, extras)
             Notif:   notifications
             Logs:    logcat (filter_text, lines)
+            Camera:  camera_photo (facing="back"|"front", auto_pull, output_path),
+                     camera_video (duration_sec, facing, output_path)
         serial: Device serial (overrides selected). Use list_devices first.
         command: Shell command string for action='shell'.
         x, y: Tap coords.
@@ -906,6 +1187,15 @@ def adb(
             return _handle_wifi_info(serial)
         if action == "screen_record":
             return _handle_screen_record(duration_sec, output_path, serial)
+        if action == "camera_photo":
+            return _handle_camera_photo(
+                output_path, serial, facing, auto_pull,
+                include_image, return_base64, camera_timeout,
+            )
+        if action == "camera_video":
+            return _handle_camera_video(
+                duration_sec, output_path, serial, facing, auto_pull,
+            )
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
