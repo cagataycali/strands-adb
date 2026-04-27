@@ -2049,6 +2049,242 @@ def _handle_video_frames(
     }
 
 
+
+
+# =============================================================================
+# 🎯  Touch / Gesture Streaming  (Frontier #2)
+# =============================================================================
+#
+# Non-rooted reality: /dev/input/event* is owned by root:input with 0660
+# perms and SELinux u:r:shell:s0 context denies writes. sendevent is not
+# available unless the device is rooted.
+#
+# The workable equivalent is the `input` binary's full command set:
+#
+#   input tap <x> <y>                              — simple tap
+#   input swipe <x1> <y1> <x2> <y2> [duration_ms]  — linear swipe
+#   input draganddrop <x1> <y1> <x2> <y2> [dur_ms] — long-press + drag
+#   input motionevent DOWN|MOVE|UP <x> <y>         — ⭐ raw gesture stream
+#   input keyevent <code>
+#   input text <string>
+#
+# motionevent is the non-root equivalent of sendevent for gesture streaming:
+# we can script arbitrary paths by emitting DOWN, N×MOVE, UP.
+#
+# This module ships:
+#
+#   gesture_stream(points, durations)
+#       Execute an arbitrary 2-D path. `points` is a list of [x,y] pairs;
+#       the first is the DOWN, middle are MOVE, last is UP. Consecutive
+#       sleeps between events are controlled by `durations` (seconds).
+#
+#   gesture_long_press(x, y, hold_ms)
+#       DOWN → hold → UP. Useful for context menus.
+#
+#   gesture_path(path_spec)
+#       High-level DSL: "line", "arc", "zigzag" (composes into motionevent).
+#
+# Multi-finger (pinch/rotate) is NOT available without root on stock
+# Android — the `input` binary only supports a single pointer. This is
+# documented as a limitation rather than faked.
+
+
+def _input_cmd(args: List[str], serial: Optional[str]) -> Dict[str, Any]:
+    """Helper: run `adb shell input <args>` and surface errors."""
+    return _run(["shell", "input"] + args, serial=serial, timeout=30)
+
+
+def _handle_gesture_stream(
+    points: List[List[float]],
+    step_delay_ms: int,
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """Execute a 2-D gesture path via motionevent DOWN/MOVE…/UP.
+
+    Args:
+        points:        [[x,y], [x,y], ...] — at least 2 points required.
+                       First = DOWN, last = UP, intermediate = MOVE.
+        step_delay_ms: Sleep between consecutive events. Smaller = faster
+                       fling, larger = smoother drag. 0..1000 ms.
+
+    Returns number of steps executed.
+    """
+    if len(points) < 2:
+        return _err("gesture_stream needs at least 2 points")
+    if step_delay_ms < 0 or step_delay_ms > 2000:
+        return _err("step_delay_ms must be 0..2000")
+
+    for i, p in enumerate(points):
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            return _err(f"point {i} must be [x, y], got {p!r}")
+        if not all(isinstance(c, (int, float)) for c in p):
+            return _err(f"point {i} coordinates must be numeric, got {p!r}")
+
+    t_start = time.time()
+    steps_done = 0
+    failures: List[str] = []
+
+    for i, (x, y) in enumerate(points):
+        ix, iy = int(x), int(y)
+        if i == 0:
+            action = "DOWN"
+        elif i == len(points) - 1:
+            action = "UP"
+        else:
+            action = "MOVE"
+
+        r = _input_cmd(["motionevent", action, str(ix), str(iy)], serial)
+        if r["returncode"] != 0:
+            failures.append(f"step {i} ({action}): {r['stderr'][:100]}")
+            # Attempt cleanup UP to avoid leaving pointer stuck
+            if i > 0 and i < len(points) - 1:
+                _input_cmd(["motionevent", "UP", str(ix), str(iy)], serial)
+            break
+        steps_done += 1
+
+        if i < len(points) - 1 and step_delay_ms > 0:
+            time.sleep(step_delay_ms / 1000)
+
+    elapsed = time.time() - t_start
+    if failures:
+        return _err(
+            f"gesture partial: {steps_done}/{len(points)} steps in "
+            f"{elapsed:.2f}s — {failures[0]}"
+        )
+    return _ok(
+        f"🎯 gesture: {steps_done} steps ({len(points)-2} moves) in "
+        f"{elapsed:.2f}s",
+        steps=steps_done,
+        elapsed_sec=elapsed,
+        points_count=len(points),
+    )
+
+
+def _handle_gesture_long_press(
+    x: int,
+    y: int,
+    hold_ms: int,
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """DOWN → hold → UP at a single point. Used for context menus."""
+    if hold_ms < 100 or hold_ms > 10000:
+        return _err("hold_ms must be 100..10000")
+
+    t_start = time.time()
+    r1 = _input_cmd(["motionevent", "DOWN", str(x), str(y)], serial)
+    if r1["returncode"] != 0:
+        return _err(f"DOWN failed: {r1['stderr'][:100]}")
+    time.sleep(hold_ms / 1000)
+    r2 = _input_cmd(["motionevent", "UP", str(x), str(y)], serial)
+    if r2["returncode"] != 0:
+        return _err(f"UP failed: {r2['stderr'][:100]}")
+    elapsed = time.time() - t_start
+    return _ok(
+        f"🎯 long-press ({x}, {y}) for {hold_ms}ms (actual: {elapsed*1000:.0f}ms)",
+        x=x, y=y, hold_ms=hold_ms, actual_elapsed_ms=int(elapsed*1000),
+    )
+
+
+def _handle_gesture_path(
+    shape: str,
+    x: int,
+    y: int,
+    size: int,
+    steps: int,
+    step_delay_ms: int,
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """High-level gesture DSL — generates points and delegates to stream.
+
+    Shapes:
+        line_h   — horizontal line starting at (x, y), length=size
+        line_v   — vertical line starting at (x, y), length=size
+        circle   — full circle centered at (x, y), radius=size
+        arc      — half-circle at (x, y), radius=size
+        zigzag   — 3 bumps at (x, y), amplitude=size/3
+        square   — closed square starting at (x, y), side=size
+    """
+    import math
+    if steps < 3 or steps > 200:
+        return _err("steps must be 3..200")
+
+    pts: List[List[float]] = []
+    if shape == "line_h":
+        for i in range(steps):
+            t = i / (steps - 1)
+            pts.append([x + size * t, y])
+    elif shape == "line_v":
+        for i in range(steps):
+            t = i / (steps - 1)
+            pts.append([x, y + size * t])
+    elif shape == "circle":
+        for i in range(steps):
+            theta = 2 * math.pi * i / (steps - 1)
+            pts.append([x + size * math.cos(theta), y + size * math.sin(theta)])
+    elif shape == "arc":
+        for i in range(steps):
+            theta = math.pi * i / (steps - 1)
+            pts.append([x + size * math.cos(theta), y - size * math.sin(theta)])
+    elif shape == "zigzag":
+        amp = size / 3
+        for i in range(steps):
+            t = i / (steps - 1)
+            bump_y = amp * math.sin(2 * math.pi * 3 * t)
+            pts.append([x + size * t, y + bump_y])
+    elif shape == "square":
+        # 4 equal-length segments, total steps distributed
+        per_side = max(2, steps // 4)
+        for seg in range(4):
+            dx, dy = [(1, 0), (0, 1), (-1, 0), (0, -1)][seg]
+            sx = x + (dx if seg > 0 else 0) * size
+            sy = y + (dy if seg > 0 else 0) * size
+            # actually compute from previous endpoint
+        # Simpler: corner walk
+        corners = [
+            [x, y], [x + size, y], [x + size, y + size],
+            [x, y + size], [x, y],
+        ]
+        for i in range(4):
+            start = corners[i]
+            end = corners[i + 1]
+            for j in range(per_side):
+                t = j / (per_side - 1) if per_side > 1 else 0
+                pts.append([
+                    start[0] + (end[0] - start[0]) * t,
+                    start[1] + (end[1] - start[1]) * t,
+                ])
+    else:
+        return _err(f"unknown shape: {shape}. "
+                    f"valid: line_h, line_v, circle, arc, zigzag, square")
+
+    return _handle_gesture_stream(pts, step_delay_ms, serial)
+
+
+def _handle_gesture_pinch(
+    cx: int,
+    cy: int,
+    size: int,
+    direction: str,
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """Pinch simulation — since multi-touch requires root/sendevent, we
+    use the Accessibility Service's dispatchGesture via `cmd` as a best
+    effort. Falls back to a clear error explaining the limitation.
+
+    Current behavior: reports that true two-finger pinch requires root.
+    Provided for API completeness so consumers get a clear explanation
+    rather than a cryptic failure.
+    """
+    return _err(
+        "true two-finger pinch requires root (sendevent to /dev/input/event*) "
+        "or a companion accessibility service app. Use pinch_via_magnification "
+        "action once implemented, or install Shizuku for non-root injection. "
+        "For single-finger alternatives: use gesture_path with shape='circle' "
+        "to simulate rotate-like motions, or use system zoom via "
+        "'settings put secure accessibility_display_magnification_enabled 1'."
+    )
+
+
 ACTIONS = {
     # device
     "list_devices", "select_device", "device_info", "battery", "wake", "unlock",
@@ -2086,6 +2322,8 @@ ACTIONS = {
     "ui_find", "ui_tap_by", "ui_wait_for",
     # Screen frames / CV (v0.8.0)
     "screen_frames", "video_frames",
+    # Gesture streaming (v0.9.0)
+    "gesture_stream", "gesture_long_press", "gesture_path", "gesture_pinch",
 }
 
 
@@ -2151,6 +2389,13 @@ def adb(
     frames_n: int = 5,
     frames_interval: float = 0.5,
     frames_output_dir: Optional[str] = None,
+    # Gesture streaming (v0.9.0)
+    gesture_points: Optional[List[List[float]]] = None,
+    gesture_hold_ms: int = 500,
+    gesture_step_delay_ms: int = 30,
+    gesture_shape: str = "line_h",
+    gesture_size: int = 300,
+    gesture_steps: int = 20,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -2181,6 +2426,14 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Gesture: gesture_stream (gesture_points=[[x,y],...], gesture_step_delay_ms=30)
+                     → streams motionevent DOWN, N×MOVE, UP. Arbitrary paths.
+                     gesture_long_press (x, y, gesture_hold_ms=500)
+                     → DOWN → hold → UP. For context menus.
+                     gesture_path (x, y, gesture_shape=line_h|line_v|circle|arc|
+                     zigzag|square, gesture_size, gesture_steps)
+                     → high-level path DSL.
+                     gesture_pinch → documented stub; multi-touch requires root.
             Frames:  screen_frames (frames_n=5, frames_interval=0.5, output_path=dir)
                      → N live screencaps as image blocks.
                      video_frames (output_path=<mp4>, frames_n=5)
@@ -2401,6 +2654,27 @@ def adb(
                 output_path, frames_n, include_image,
                 frames_output_dir,
             )
+
+        # Gesture streaming (v0.9.0)
+        if action == "gesture_stream":
+            return _handle_gesture_stream(
+                gesture_points or [], gesture_step_delay_ms, serial,
+            )
+        if action == "gesture_long_press":
+            if x is None or y is None:
+                return _err("gesture_long_press requires x, y")
+            return _handle_gesture_long_press(x, y, gesture_hold_ms, serial)
+        if action == "gesture_path":
+            if x is None or y is None:
+                return _err("gesture_path requires x, y (path anchor)")
+            return _handle_gesture_path(
+                gesture_shape, x, y, gesture_size, gesture_steps,
+                gesture_step_delay_ms, serial,
+            )
+        if action == "gesture_pinch":
+            if x is None or y is None:
+                return _err("gesture_pinch requires x, y (pinch center)")
+            return _handle_gesture_pinch(x, y, gesture_size, gesture_shape, serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
