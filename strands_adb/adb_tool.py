@@ -2666,6 +2666,531 @@ def _handle_accessibility_status(serial: Optional[str]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# 📡  Connectivity: Wi-Fi, Bluetooth, Airplane Mode  (Frontier #7)
+# =============================================================================
+#
+# Agents read + control radio state. All APIs are standard `cmd` services —
+# no root required.
+#
+#   cmd wifi status|set-wifi-enabled|start-scan|list-scan-results
+#       |list-networks|connect-network|forget-network
+#   cmd bluetooth_manager enable|disable|wait-for-state:STATE_ON
+#   dumpsys bluetooth_manager    — state + bonded devices
+#   cmd connectivity airplane-mode [enable|disable]
+#
+# We favour cmd (service dispatcher) over legacy `svc wifi` because cmd is
+# the modern non-deprecated path and gives structured output.
+
+
+def _extract_leading_int(v: str) -> Optional[int]:
+    """Extract the leading integer from a string like '2401Mbps', '-57', '6135MHz'."""
+    import re as _re
+    if v is None:
+        return None
+    m = _re.match(r"\s*(-?\d+)", str(v))
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+# Wi-Fi security types accepted by `cmd wifi add/connect-network`
+WIFI_SECURITY_TYPES = {"open", "owe", "wpa2", "wpa3", "wep"}
+
+
+def _parse_wifi_status(out: str) -> Dict[str, Any]:
+    """Parse `cmd wifi status` output.
+
+    Example output (connected):
+      Wifi is enabled
+      ==== Primary ClientModeManager instance ====
+      Wifi is connected to TestSSID
+      WifiInfo: SSID: "TestSSID", BSSID: aa:bb:cc:dd:ee:ff, ...
+      Supplicant state: COMPLETED
+      ...
+
+    Example output (disconnected):
+      Wifi is enabled
+      Wifi is not connected
+    """
+    info: Dict[str, Any] = {
+        "enabled": False,
+        "connected": False,
+        "ssid": None,
+        "bssid": None,
+        "ip_address": None,
+        "link_speed_mbps": None,
+        "rssi": None,
+        "frequency": None,
+    }
+    for raw in (out or "").splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if low.startswith("wifi is enabled"):
+            info["enabled"] = True
+        elif low.startswith("wifi is disabled"):
+            info["enabled"] = False
+        elif low.startswith("wifi is connected to"):
+            info["connected"] = True
+            raw_ssid = line.split("connected to", 1)[1].strip()
+            info["ssid"] = raw_ssid.strip().strip('"')
+        elif low.startswith("wifi is not connected"):
+            info["connected"] = False
+        elif line.startswith("WifiInfo:"):
+            # "WifiInfo: SSID: \"X\", BSSID: aa:..., Supplicant state: ..."
+            # Parse key:value pairs separated by ", "
+            payload = line.split(":", 1)[1]
+            parts = [p.strip() for p in payload.split(",")]
+            for part in parts:
+                if ":" not in part:
+                    continue
+                k, v = part.split(":", 1)
+                k = k.strip().lower()
+                v = v.strip().strip('"')
+                if k == "ssid" and info["ssid"] is None:
+                    info["ssid"] = v
+                elif k == "bssid":
+                    info["bssid"] = v
+                elif k in ("ip", "ip_address"):
+                    info["ip_address"] = v
+                elif k == "rssi":
+                    info["rssi"] = _extract_leading_int(v)
+                elif k == "link speed":
+                    # "Link speed: 2401Mbps" — there's also "Tx Link speed",
+                    # "Rx Link speed" etc; only match exact "link speed"
+                    info["link_speed_mbps"] = _extract_leading_int(v)
+                elif k == "frequency":
+                    info["frequency"] = _extract_leading_int(v)
+    return info
+
+
+def _parse_scan_results(out: str) -> List[Dict[str, Any]]:
+    """Parse `cmd wifi list-scan-results` table.
+
+    Header row:
+      BSSID              Frequency      RSSI           Age(sec)     SSID           Flags
+    Data rows use whitespace columns — SSID may contain spaces, Flags may
+    contain brackets. Strategy: split on ≥2 spaces, take first 4 fields,
+    then SSID is field 4 and Flags is everything after the SSID field.
+    """
+    results: List[Dict[str, Any]] = []
+    lines = (out or "").splitlines()
+    if not lines:
+        return results
+    # Skip until we see the header
+    for i, line in enumerate(lines):
+        if line.strip().startswith("BSSID") and "RSSI" in line and "SSID" in line:
+            data_lines = lines[i + 1:]
+            break
+    else:
+        # No header — nothing to parse (e.g. "No scan results")
+        return results
+
+    for raw in data_lines:
+        line = raw.strip()
+        if not line:
+            continue
+        # Split on runs of 2+ spaces to preserve SSID that has spaces
+        # but NOT to glue columns together when SSID is empty.
+        parts = [p for p in _split_on_multi_space(line) if p]
+        if len(parts) < 4:
+            continue
+        try:
+            bssid = parts[0]
+            freq = int(parts[1])
+            rssi = int(parts[2])
+            age = float(parts[3])
+        except ValueError:
+            continue
+        # If parts[4] starts with '[', it's actually the flags column —
+        # meaning this network has an empty SSID (hidden network).
+        ssid = ""
+        flags_start_idx = 4
+        if len(parts) >= 5:
+            if parts[4].startswith("["):
+                ssid = ""
+                flags_start_idx = 4
+            else:
+                ssid = parts[4]
+                flags_start_idx = 5
+        # Flags are bracketed; collect anything starting with "["
+        flags: List[str] = []
+        for p in parts[flags_start_idx:]:
+            if p.startswith("["):
+                # may be multiple concatenated flags
+                for chunk in _split_flags(p):
+                    flags.append(chunk)
+        # Determine security class from flags
+        security = _security_from_flags(flags)
+        results.append({
+            "bssid": bssid,
+            "frequency": freq,
+            "rssi": rssi,
+            "age_sec": age,
+            "ssid": ssid,
+            "flags": flags,
+            "security": security,
+            "band": ("2.4GHz" if freq < 3000 else
+                     "5GHz" if freq < 6000 else "6GHz"),
+        })
+    return results
+
+
+def _split_on_multi_space(line: str) -> List[str]:
+    """Split on 2+ spaces. Preserves single spaces inside SSIDs."""
+    import re as _re
+    return _re.split(r"\s{2,}", line)
+
+
+def _split_flags(s: str) -> List[str]:
+    """Split 'foo][bar]' or '[foo][bar]' into ['[foo]', '[bar]']."""
+    out = []
+    cur = ""
+    depth = 0
+    for ch in s:
+        cur += ch
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0 and cur:
+                out.append(cur)
+                cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _security_from_flags(flags: List[str]) -> str:
+    """Derive human-friendly security type from the flags column."""
+    flat = " ".join(flags).upper()
+    if "SAE" in flat:  return "wpa3"
+    if "WPA2" in flat or "RSN" in flat: return "wpa2"
+    if "WPA" in flat:  return "wpa"
+    if "WEP" in flat:  return "wep"
+    if "OWE" in flat:  return "owe"
+    if not flags or flat.strip() in ("", "[ESS]"): return "open"
+    return "unknown"
+
+
+def _parse_saved_networks(out: str) -> List[Dict[str, Any]]:
+    """Parse `cmd wifi list-networks` table.
+
+    Header:  Network Id      SSID                         Security type
+    Data:    0            Verizon_SG4VBJ                   wpa2-psk
+             0            Verizon_SG4VBJ                   wpa3-sae^
+    The same network_id can appear on multiple lines (one per security
+    type variant). We collapse them into a single entry with a list of
+    security types.
+    """
+    by_id: Dict[int, Dict[str, Any]] = {}
+    lines = (out or "").splitlines()
+    in_data = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("Network Id"):
+            in_data = True
+            continue
+        if not in_data:
+            continue
+        parts = _split_on_multi_space(line)
+        if len(parts) < 3:
+            continue
+        try:
+            nid = int(parts[0])
+        except ValueError:
+            continue
+        ssid = parts[1]
+        sec = parts[2].rstrip("^").strip()
+
+        entry = by_id.setdefault(nid, {
+            "network_id": nid,
+            "ssid": ssid,
+            "security_types": [],
+        })
+        if sec not in entry["security_types"]:
+            entry["security_types"].append(sec)
+
+    return list(by_id.values())
+
+
+def _parse_bt_status(out: str) -> Dict[str, Any]:
+    """Parse `dumpsys bluetooth_manager` output."""
+    info: Dict[str, Any] = {
+        "enabled": False,
+        "name": None,
+        "address": None,
+        "state": None,
+        "discovering": False,
+        "bonded_count": 0,
+        "connection_state": None,
+    }
+    in_props = False
+    for raw in (out or "").splitlines():
+        line = raw.strip()
+        # Top-level "State: ON/OFF"
+        if line.startswith("State:"):
+            val = line.split(":", 1)[1].strip()
+            info["state"] = val
+            info["enabled"] = (val == "ON")
+        elif line.startswith("Name:"):
+            info["name"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Address:"):
+            info["address"] = line.split(":", 1)[1].strip()
+        elif line.startswith("ConnectionState:"):
+            info["connection_state"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Discovering:"):
+            info["discovering"] = line.split(":", 1)[1].strip().lower() == "true"
+        elif line.startswith("Bonded devices:"):
+            try:
+                info["bonded_count"] = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    return info
+
+
+# --- handlers ----------------------------------------------------------
+
+def _handle_wifi_status(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(["shell", "cmd", "wifi", "status"], serial=serial, timeout=5)
+    if r["returncode"] != 0:
+        return _err(f"wifi status failed: {r['stderr'][:120]}")
+    info = _parse_wifi_status(r["stdout"] or "")
+    if info["connected"]:
+        msg = (f"📡 wifi ON, connected to {info['ssid']} "
+               f"({info.get('rssi', '?')} dBm, {info.get('frequency', '?')} MHz)")
+    elif info["enabled"]:
+        msg = "📡 wifi ON, not connected"
+    else:
+        msg = "📡 wifi OFF"
+    return _ok(msg, **info)
+
+
+def _handle_wifi_enable(
+    enabled: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    flag = "enabled" if enabled else "disabled"
+    r = _run(
+        ["shell", "cmd", "wifi", "set-wifi-enabled", flag],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"wifi toggle failed: {r['stderr'][:120]}")
+
+    # Give it a moment, then verify
+    time.sleep(1.5)
+    status = _handle_wifi_status(serial)
+    ok = status.get("enabled") == enabled
+    return _ok(
+        f"📡 wifi → {'ON' if enabled else 'OFF'} "
+        f"(verified: {'✓' if ok else '⏳'})",
+        requested=enabled,
+        actual_enabled=status.get("enabled"),
+    )
+
+
+def _handle_wifi_scan(
+    serial: Optional[str], wait_sec: float = 4.0
+) -> Dict[str, Any]:
+    """Trigger a fresh scan and return results."""
+    # Must be enabled first
+    status = _run(["shell", "cmd", "wifi", "status"], serial=serial, timeout=5)
+    if "Wifi is disabled" in (status["stdout"] or ""):
+        return _err("wifi is disabled; enable first with wifi_enable")
+
+    r = _run(["shell", "cmd", "wifi", "start-scan"], serial=serial, timeout=5)
+    if r["returncode"] != 0:
+        return _err(f"start-scan failed: {r['stderr'][:120]}")
+
+    time.sleep(wait_sec)
+
+    r = _run(
+        ["shell", "cmd", "wifi", "list-scan-results"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"list-scan-results failed: {r['stderr'][:120]}")
+
+    networks = _parse_scan_results(r["stdout"] or "")
+    # Sort by RSSI (strongest first)
+    networks.sort(key=lambda n: n["rssi"], reverse=True)
+
+    lines = [f"📡 {len(networks)} networks found:"]
+    for n in networks[:10]:
+        lines.append(
+            f"  {n['rssi']:>4} dBm  {n['band']:>6}  "
+            f"{n['security']:>7}  {n['ssid']!r}"
+        )
+    return _ok(
+        "\n".join(lines),
+        networks=networks,
+        count=len(networks),
+    )
+
+
+def _handle_wifi_list_saved(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(
+        ["shell", "cmd", "wifi", "list-networks"],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"list-networks failed: {r['stderr'][:120]}")
+    saved = _parse_saved_networks(r["stdout"] or "")
+
+    lines = [f"📡 {len(saved)} saved networks:"]
+    for n in saved[:15]:
+        sec = "/".join(n["security_types"])
+        lines.append(
+            f"  [{n['network_id']:>3}]  {n['ssid']!r:30s}  ({sec})"
+        )
+    return _ok("\n".join(lines), saved=saved, count=len(saved))
+
+
+def _handle_wifi_connect(
+    ssid: str, security: str, passphrase: Optional[str],
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    if not ssid:
+        return _err("wifi_connect requires wifi_ssid")
+    security = (security or "").lower().strip()
+    if security not in WIFI_SECURITY_TYPES:
+        return _err(
+            f"security must be one of {sorted(WIFI_SECURITY_TYPES)} "
+            f"(got {security!r})"
+        )
+    if security in ("wpa2", "wpa3", "wep") and not passphrase:
+        return _err(f"{security} requires wifi_passphrase")
+    if security in ("open", "owe") and passphrase:
+        return _err(f"{security} does not take a passphrase")
+
+    args = ["shell", "cmd", "wifi", "connect-network", ssid, security]
+    if passphrase:
+        args.append(passphrase)
+
+    r = _run(args, serial=serial, timeout=15)
+    if r["returncode"] != 0:
+        return _err(f"connect-network failed: {r['stderr'][:120]}")
+
+    # Give it a moment
+    time.sleep(2.0)
+    status = _handle_wifi_status(serial)
+    return _ok(
+        f"📡 connect requested for {ssid!r} "
+        f"(now: {'connected to ' + str(status.get('ssid')) if status.get('connected') else 'not yet connected'})",
+        ssid=ssid,
+        security=security,
+        **{k: status.get(k) for k in ("connected", "ssid", "bssid")},
+    )
+
+
+def _handle_wifi_forget(
+    network_id: int, serial: Optional[str]
+) -> Dict[str, Any]:
+    if not isinstance(network_id, int) or network_id < 0:
+        return _err("wifi_network_id must be a non-negative int")
+    r = _run(
+        ["shell", "cmd", "wifi", "forget-network", str(network_id)],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"forget-network failed: {r['stderr'][:120]}")
+    return _ok(
+        f"📡 forgot network id {network_id}",
+        network_id=network_id,
+        stdout=(r["stdout"] or "").strip()[:200],
+    )
+
+
+def _handle_bt_status(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(
+        ["shell", "dumpsys", "bluetooth_manager"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys bluetooth_manager failed: {r['stderr'][:120]}")
+
+    info = _parse_bt_status(r["stdout"] or "")
+    if info["enabled"]:
+        msg = (f"🅱️ bluetooth ON — {info.get('name', '?')} "
+               f"({info.get('address', '?')[:8]}…), "
+               f"{info['bonded_count']} bonded, "
+               f"{'discovering' if info['discovering'] else 'idle'}")
+    else:
+        msg = f"🅱️ bluetooth {info.get('state') or 'OFF'}"
+    return _ok(msg, **info)
+
+
+def _handle_bt_enable(
+    enabled: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    cmd = "enable" if enabled else "disable"
+    r = _run(
+        ["shell", "cmd", "bluetooth_manager", cmd],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"bluetooth toggle failed: {r['stderr'][:120]}")
+
+    # Wait for state change; check up to 5s
+    want = "STATE_ON" if enabled else "STATE_OFF"
+    for _ in range(10):
+        time.sleep(0.5)
+        status = _handle_bt_status(serial)
+        if status.get("enabled") == enabled:
+            break
+
+    return _ok(
+        f"🅱️ bluetooth → {'ON' if enabled else 'OFF'} "
+        f"(state: {status.get('state')})",
+        requested=enabled,
+        actual_enabled=status.get("enabled"),
+    )
+
+
+def _handle_airplane_mode_get(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(
+        ["shell", "cmd", "connectivity", "airplane-mode"],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"airplane-mode get failed: {r['stderr'][:120]}")
+    out = (r["stdout"] or "").strip().lower()
+    enabled = out == "enabled"
+    return _ok(
+        f"✈️ airplane mode: {'ON' if enabled else 'OFF'}",
+        enabled=enabled,
+        raw=out,
+    )
+
+
+def _handle_airplane_mode_set(
+    enabled: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    flag = "enable" if enabled else "disable"
+    r = _run(
+        ["shell", "cmd", "connectivity", "airplane-mode", flag],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"airplane-mode set failed: {r['stderr'][:120]}")
+
+    time.sleep(1.0)
+    # Verify
+    verify = _handle_airplane_mode_get(serial)
+    return _ok(
+        f"✈️ airplane mode → {'ON' if enabled else 'OFF'} "
+        f"(verified: {'✓' if verify.get('enabled') == enabled else '⏳'})",
+        requested=enabled,
+        actual_enabled=verify.get("enabled"),
+    )
+
+
+
+# =============================================================================
 # 🎵  Media Session & AVRCP  (Frontier #5)
 # =============================================================================
 #
@@ -3520,6 +4045,11 @@ ACTIONS = {
     # Media session (v0.12.0)
     "media_dispatch", "media_volume_get", "media_volume_set",
     "media_volume_adjust", "media_sessions_list", "media_now_playing",
+    # Connectivity (v0.13.0)
+    "wifi_status", "wifi_enable", "wifi_scan",
+    "wifi_list_saved", "wifi_connect", "wifi_forget",
+    "bt_status", "bt_enable",
+    "airplane_mode_get", "airplane_mode_set",
 }
 
 
@@ -3613,6 +4143,15 @@ def adb(
     media_volume_index: int = 0,
     media_volume_direction: str = "raise",
     media_volume_show_ui: bool = False,
+    # Connectivity (v0.13.0)
+    wifi_enabled: bool = True,
+    wifi_ssid: Optional[str] = None,
+    wifi_security: str = "wpa2",
+    wifi_passphrase: Optional[str] = None,
+    wifi_network_id: int = 0,
+    wifi_scan_wait_sec: float = 4.0,
+    bt_enabled: bool = True,
+    airplane_enabled: bool = False,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -3643,6 +4182,21 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Connect: wifi_status → enabled/connected/ssid/rssi/frequency.
+                     wifi_enable (wifi_enabled=True|False).
+                     wifi_scan (wifi_scan_wait_sec=4.0) → list of {bssid,
+                     ssid, rssi, frequency, band, security, flags}.
+                     wifi_list_saved → saved networks {network_id, ssid,
+                     security_types}.
+                     wifi_connect (wifi_ssid=..., wifi_security='wpa2'|
+                     'wpa3'|'wep'|'open'|'owe', wifi_passphrase=...)
+                     → connect + save.
+                     wifi_forget (wifi_network_id=N) → remove saved.
+                     bt_status → {enabled, name, address, state,
+                     bonded_count, discovering, connection_state}.
+                     bt_enable (bt_enabled=True|False).
+                     airplane_mode_get → {enabled}.
+                     airplane_mode_set (airplane_enabled=True|False).
             Media:   media_dispatch (media_key='play-pause'|'play'|'pause'|'next'|
                      'previous'|'stop'|'rewind'|'fast-forward'|'mute'|'headsethook')
                      → global media key (works across Spotify/YouTube/Music/etc).
@@ -3991,6 +4545,30 @@ def adb(
             return _handle_media_sessions_list(serial)
         if action == "media_now_playing":
             return _handle_media_now_playing(serial)
+
+        # Connectivity (v0.13.0)
+        if action == "wifi_status":
+            return _handle_wifi_status(serial)
+        if action == "wifi_enable":
+            return _handle_wifi_enable(wifi_enabled, serial)
+        if action == "wifi_scan":
+            return _handle_wifi_scan(serial, wait_sec=wifi_scan_wait_sec)
+        if action == "wifi_list_saved":
+            return _handle_wifi_list_saved(serial)
+        if action == "wifi_connect":
+            return _handle_wifi_connect(
+                wifi_ssid, wifi_security, wifi_passphrase, serial,
+            )
+        if action == "wifi_forget":
+            return _handle_wifi_forget(wifi_network_id, serial)
+        if action == "bt_status":
+            return _handle_bt_status(serial)
+        if action == "bt_enable":
+            return _handle_bt_enable(bt_enabled, serial)
+        if action == "airplane_mode_get":
+            return _handle_airplane_mode_get(serial)
+        if action == "airplane_mode_set":
+            return _handle_airplane_mode_set(airplane_enabled, serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
