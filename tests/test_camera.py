@@ -9,6 +9,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from strands_adb.adb_tool import adb
 
 
+def _is_unlocked():
+    """Keyguard not showing → unlocked."""
+    import subprocess
+    r = subprocess.run(
+        ["adb", "shell", "dumpsys", "window"],
+        capture_output=True, text=True, timeout=10,
+    )
+    # KeyguardStateMonitor.mIsShowing tracks lock-screen visibility
+    for line in r.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("mIsShowing="):
+            return stripped == "mIsShowing=false"
+    return True  # unknown = assume unlocked
+
+
+def _skip_if_locked():
+    if not _is_unlocked():
+        print("⏭  skip: device locked (camera tests need unlocked screen)")
+        return True
+    return False
+
+
 def _has_device() -> bool:
     r = adb(action="list_devices")
     return r.get("status") == "success" and bool(r.get("devices"))
@@ -18,6 +40,8 @@ def test_camera_photo_back():
     """Take a back-camera photo and verify image block + JPEG file."""
     if not _has_device():
         print("⏭  skip: no adb device")
+        return
+    if _skip_if_locked():
         return
     print("📸 test_camera_photo_back ...")
     r = adb(action="camera_photo", facing="back", camera_timeout=20)
@@ -41,6 +65,8 @@ def test_camera_photo_no_pull():
     if not _has_device():
         print("⏭  skip: no adb device")
         return
+    if _skip_if_locked():
+        return
     print("📸 test_camera_photo_no_pull ...")
     r = adb(action="camera_photo", facing="back",
             auto_pull=False, camera_timeout=20)
@@ -54,6 +80,8 @@ def test_camera_front():
     """Front-facing camera toggle works."""
     if not _has_device():
         print("⏭  skip: no adb device")
+        return
+    if _skip_if_locked():
         return
     print("📸 test_camera_front ...")
     r = adb(action="camera_photo", facing="front", camera_timeout=20)

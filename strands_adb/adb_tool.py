@@ -747,7 +747,7 @@ def _handle_notifications_parsed(serial: Optional[str]) -> Dict[str, Any]:
     return _ok("\n".join(lines), notifications=parsed)
 
 
-def _handle_ui_find(
+def _handle_ui_find_legacy(
     serial: Optional[str],
     text: Optional[str],
     desc: Optional[str],
@@ -779,7 +779,7 @@ def _handle_ui_find(
     )
 
 
-def _handle_smart_tap(
+def _handle_smart_tap_legacy(
     serial: Optional[str],
     text: Optional[str],
     desc: Optional[str],
@@ -1525,6 +1525,278 @@ def _handle_setting_dump(
     }
 
 
+
+
+# =============================================================================
+# 🎯  UI Query DSL  (Frontier #10)
+# =============================================================================
+#
+# Ergonomic layer on top of raw ui_dump XML. Instead of scraping coords by
+# hand, agents can say:
+#
+#   adb("ui_find", text="Settings")                    → list of matches
+#   adb("ui_tap_by", text="Settings")                  → finds + taps center
+#   adb("ui_wait_for", text="OK", timeout=5)           → polls until visible
+#
+# Matchers compose: text="Chat", class_="...TextView", clickable=True.
+# All string matchers do case-insensitive substring match by default;
+# pass an "=..." prefix for exact match, or "^" for regex.
+
+import xml.etree.ElementTree as _ET
+
+
+_BOUNDS_RE = re.compile(r"\[(\-?\d+),(\-?\d+)\]\[(\-?\d+),(\-?\d+)\]")
+
+
+def _match_str(value: str, pattern: str) -> bool:
+    """Match a UI attribute against a pattern spec.
+
+    Patterns:
+      "foo"    → case-insensitive substring
+      "=foo"   → exact case-sensitive match
+      "^regex" → regex search (case-insensitive)
+    """
+    if not pattern:
+        return True
+    if pattern.startswith("="):
+        return value == pattern[1:]
+    if pattern.startswith("^"):
+        try:
+            return bool(re.search(pattern[1:], value, re.IGNORECASE))
+        except re.error:
+            return False
+    return pattern.lower() in (value or "").lower()
+
+
+def _parse_bounds(bounds_str: str) -> Optional[Tuple[int, int, int, int]]:
+    """Parse '[x1,y1][x2,y2]' → (x1, y1, x2, y2) or None."""
+    m = _BOUNDS_RE.search(bounds_str or "")
+    if not m:
+        return None
+    return tuple(int(g) for g in m.groups())  # type: ignore
+
+
+def _node_to_match(node: "_ET.Element") -> Dict[str, Any]:
+    """Turn a UI XML node → flat dict with center coords."""
+    attrs = node.attrib
+    bounds = _parse_bounds(attrs.get("bounds", ""))
+    cx = cy = None
+    if bounds:
+        x1, y1, x2, y2 = bounds
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    return {
+        "text": attrs.get("text", ""),
+        "resource_id": attrs.get("resource-id", ""),
+        "class_name": attrs.get("class", ""),
+        "content_desc": attrs.get("content-desc", ""),
+        "package": attrs.get("package", ""),
+        "clickable": attrs.get("clickable") == "true",
+        "scrollable": attrs.get("scrollable") == "true",
+        "enabled": attrs.get("enabled") == "true",
+        "selected": attrs.get("selected") == "true",
+        "bounds": bounds,
+        "center": (cx, cy) if bounds else None,
+    }
+
+
+def _iter_ui_nodes(xml_text: str):
+    """Yield all XML nodes from a ui_dump."""
+    try:
+        root = _ET.fromstring(xml_text)
+    except _ET.ParseError:
+        return
+    # ui_dump nests <hierarchy><node>...<node>...
+    for node in root.iter("node"):
+        yield node
+
+
+def _filter_ui(
+    xml_text: str,
+    *,
+    text: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    class_name: Optional[str] = None,
+    content_desc: Optional[str] = None,
+    clickable: Optional[bool] = None,
+    scrollable: Optional[bool] = None,
+    package: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return all nodes matching the given filters."""
+    results: List[Dict[str, Any]] = []
+    for node in _iter_ui_nodes(xml_text):
+        a = node.attrib
+        if text is not None and not _match_str(a.get("text", ""), text):
+            # also try content-desc as fallback (many icons have desc, no text)
+            if not _match_str(a.get("content-desc", ""), text):
+                continue
+        if resource_id is not None and not _match_str(a.get("resource-id", ""), resource_id):
+            continue
+        if class_name is not None and not _match_str(a.get("class", ""), class_name):
+            continue
+        if content_desc is not None and not _match_str(a.get("content-desc", ""), content_desc):
+            continue
+        if package is not None and not _match_str(a.get("package", ""), package):
+            continue
+        if clickable is not None and (a.get("clickable") == "true") != clickable:
+            continue
+        if scrollable is not None and (a.get("scrollable") == "true") != scrollable:
+            continue
+        m = _node_to_match(node)
+        # Drop nodes with no bounds — invisible / degenerate
+        if not m["bounds"]:
+            continue
+        results.append(m)
+    return results
+
+
+def _get_ui_xml(serial: Optional[str]) -> Optional[str]:
+    """Fetch a fresh ui_dump XML. Returns None on failure."""
+    # Use the existing ui_dump handler but only care about its xml
+    try:
+        r = _handle_ui_dump(serial)  # noqa: F821 — defined elsewhere
+    except Exception:
+        return None
+    return r.get("xml") if isinstance(r, dict) else None
+
+
+def _handle_ui_find(
+    serial: Optional[str],
+    text: Optional[str],
+    resource_id: Optional[str],
+    class_name: Optional[str],
+    content_desc: Optional[str],
+    clickable: Optional[bool],
+    scrollable: Optional[bool],
+    package: Optional[str],
+) -> Dict[str, Any]:
+    """Find all UI nodes matching the filters."""
+    xml_text = _get_ui_xml(serial)
+    if not xml_text:
+        return _err("ui_find: could not fetch ui_dump")
+    matches = _filter_ui(
+        xml_text,
+        text=text, resource_id=resource_id, class_name=class_name,
+        content_desc=content_desc, clickable=clickable, scrollable=scrollable,
+        package=package,
+    )
+    preview_lines = []
+    for m in matches[:10]:
+        preview_lines.append(
+            f"  • {m['text'][:30]!r} (desc={m['content_desc'][:20]!r}) "
+            f"@ {m['center']} clickable={m['clickable']} "
+            f"id={m['resource_id'].split('/')[-1][:25]}"
+        )
+    more = f"\n  … and {len(matches) - 10} more" if len(matches) > 10 else ""
+    return {
+        "status": "success",
+        "content": [{"text": f"🎯 ui_find: {len(matches)} match(es)\n"
+                              + "\n".join(preview_lines) + more}],
+        "matches": matches,
+        "count": len(matches),
+    }
+
+
+def _handle_ui_tap_by(
+    serial: Optional[str],
+    text: Optional[str],
+    resource_id: Optional[str],
+    class_name: Optional[str],
+    content_desc: Optional[str],
+    clickable: Optional[bool],
+    package: Optional[str],
+    index: int,
+) -> Dict[str, Any]:
+    """Find the Nth matching node and tap its center."""
+    # Default: require clickable=True for tap_by to avoid tapping labels
+    if clickable is None:
+        clickable = True
+
+    xml_text = _get_ui_xml(serial)
+    if not xml_text:
+        return _err("ui_tap_by: could not fetch ui_dump")
+    matches = _filter_ui(
+        xml_text,
+        text=text, resource_id=resource_id, class_name=class_name,
+        content_desc=content_desc, clickable=clickable, package=package,
+    )
+    if not matches:
+        return _err(f"ui_tap_by: no match for "
+                    f"text={text!r} resource_id={resource_id!r} "
+                    f"class_={class_name!r} desc={content_desc!r} "
+                    f"(clickable={clickable})")
+    if index >= len(matches):
+        return _err(f"ui_tap_by: index {index} out of range ({len(matches)} matches)")
+
+    target = matches[index]
+    cx, cy = target["center"]
+    # Tap
+    rc, out, errout = _run_shell_capture(
+        ["input", "tap", str(cx), str(cy)], serial
+    )
+    if rc != 0:
+        return _err(f"ui_tap_by: tap failed: {errout or out}")
+    return {
+        "status": "success",
+        "content": [{"text": f"🎯 tapped {target['text'][:40]!r} "
+                              f"(desc={target['content_desc'][:30]!r}) "
+                              f"@ ({cx},{cy}) [match {index+1}/{len(matches)}]"}],
+        "target": target,
+        "tap": {"x": cx, "y": cy},
+        "total_matches": len(matches),
+    }
+
+
+def _handle_ui_wait_for(
+    serial: Optional[str],
+    text: Optional[str],
+    resource_id: Optional[str],
+    class_name: Optional[str],
+    content_desc: Optional[str],
+    clickable: Optional[bool],
+    package: Optional[str],
+    timeout: float,
+    poll_interval: float,
+) -> Dict[str, Any]:
+    """Poll ui_dump until a match appears (or timeout)."""
+    deadline = time.time() + timeout
+    polls = 0
+    while time.time() < deadline:
+        polls += 1
+        xml_text = _get_ui_xml(serial)
+        if xml_text:
+            matches = _filter_ui(
+                xml_text,
+                text=text, resource_id=resource_id, class_name=class_name,
+                content_desc=content_desc, clickable=clickable, package=package,
+            )
+            if matches:
+                elapsed = timeout - (deadline - time.time())
+                return {
+                    "status": "success",
+                    "content": [{"text": f"✅ ui_wait_for found {len(matches)} match(es) "
+                                          f"after {elapsed:.1f}s ({polls} polls). "
+                                          f"First: {matches[0]['text'][:40]!r} "
+                                          f"@ {matches[0]['center']}"}],
+                    "matches": matches,
+                    "count": len(matches),
+                    "elapsed_sec": elapsed,
+                    "polls": polls,
+                }
+        time.sleep(poll_interval)
+
+    return {
+        "status": "error",
+        "content": [{"text": f"⏱  ui_wait_for timeout after {timeout}s "
+                              f"({polls} polls) — no match for "
+                              f"text={text!r} id={resource_id!r}"}],
+        "matches": [],
+        "count": 0,
+        "elapsed_sec": timeout,
+        "polls": polls,
+        "timed_out": True,
+    }
+
+
 ACTIONS = {
     # device
     "list_devices", "select_device", "device_info", "battery", "wake", "unlock",
@@ -1558,6 +1830,8 @@ ACTIONS = {
     "setting_get", "setting_put", "setting_delete", "setting_list",
     "setting_dump", "set_ringer", "set_brightness", "set_bluetooth",
     "set_airplane_mode",
+    # UI query DSL (v0.7.0)
+    "ui_find", "ui_tap_by", "ui_wait_for",
 }
 
 
@@ -1612,6 +1886,13 @@ def adb(
     setting_key: Optional[str] = None,
     setting_value: Optional[Any] = None,
     auto_brightness: Optional[bool] = None,
+    # UI query DSL (v0.7.0)
+    class_name: Optional[str] = None,
+    clickable_filter: Optional[bool] = None,
+    scrollable_filter: Optional[bool] = None,
+    ui_index: int = 0,
+    ui_timeout: float = 5.0,
+    ui_poll_interval: float = 0.5,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -1642,6 +1923,11 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            UI DSL:  ui_find, ui_tap_by, ui_wait_for — filters: text, resource_id,
+                     class_name, desc_filter (content-desc), clickable_filter,
+                     scrollable_filter, package. Matchers: "foo" substring,
+                     "=foo" exact, "^regex" regex. ui_tap_by defaults to
+                     clickable=True; ui_wait_for takes ui_timeout / ui_poll_interval.
             Settings: setting_get/put/delete/list (namespace, setting_key, setting_value),
                       setting_dump (full snapshot),
                       set_ringer (setting_value="normal"|"silent"|"vibrate"),
@@ -1761,10 +2047,9 @@ def adb(
         # --- Smart layer ---
         if action == "notifications_parsed":
             return _handle_notifications_parsed(serial)
-        if action == "ui_find":
-            return _handle_ui_find(serial, text, desc_filter, resource_id)
+        # Old ui_find removed — use the richer v0.7.0 ui_find below.
         if action == "smart_tap":
-            return _handle_smart_tap(serial, text, desc_filter, resource_id)
+            return _handle_smart_tap_legacy(serial, text, desc_filter, resource_id)
         if action == "sensors":
             return _handle_sensors(serial)
         if action == "thermals":
@@ -1821,6 +2106,23 @@ def adb(
         if action == "set_airplane_mode":
             return _handle_set_airplane_mode(
                 bool(setting_value) if setting_value is not None else False, serial
+            )
+
+        # UI Query DSL (v0.7.0)
+        if action == "ui_find":
+            return _handle_ui_find(
+                serial, text, resource_id, class_name, desc_filter,
+                clickable_filter, scrollable_filter, package,
+            )
+        if action == "ui_tap_by":
+            return _handle_ui_tap_by(
+                serial, text, resource_id, class_name, desc_filter,
+                clickable_filter, package, ui_index,
+            )
+        if action == "ui_wait_for":
+            return _handle_ui_wait_for(
+                serial, text, resource_id, class_name, desc_filter,
+                clickable_filter, package, ui_timeout, ui_poll_interval,
             )
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
