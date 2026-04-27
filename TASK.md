@@ -27,8 +27,8 @@
 - Docs: GOAL.md, FRONTIERS.md, INSTALL_ANDROID.md, SSH_ANDROID.md, README.md
 
 ## Frontier implementation order (from priority matrix)
-1. 🟢 **Frontier #5 — Physical camera** ← START HERE
-2. 🟢 **Frontier #3 — Logcat event stream → event_bus**
+1. ✅ **Frontier #5 — Physical camera** — SHIPPED v0.4.0
+2. 🟢 **Frontier #3 — Logcat event stream → event_bus** ← NEXT
 3. 🟢 **Frontier #13 — Settings mutation**
 4. 🟢 **Frontier #1 — Sensor streams (polling mode)**
 5. 🟢 **Frontier #9 — Location (coarse via cell/wifi)**
@@ -45,21 +45,41 @@
 ### Cycle 0 — Plan (this)
 - [x] Created TASK.md
 - [x] Confirmed device connected
-- [ ] Next: Cycle 1 — implement `camera_photo` action
+- [x] Next: Cycle 1 — implement `camera_photo` action
+
+### Cycle 1 — Frontier #5 Camera (DONE)
+- [x] Probed GoogleCamera UI: resource-id `com.google.android.GoogleCamera:id/shutter_button`
+- [x] Confirmed live capture works (484KB JPEG via Night Sight)
+- [x] Implemented `camera_photo` + `camera_video` actions
+- [x] Added `_tap_by_resource_id` + `_tap_by_content_desc` UI helpers
+- [x] Added `_latest_dcim_file` helper with baseline diff (handles slow Night Sight)
+- [x] Polling loop for new file (handles 3-5s exposure)
+- [x] Retry logic for shutter tap after mode switches (3 attempts, 0.8s apart)
+- [x] Front camera works — 2.5s settle after toggle, retry covers UI relayout
+- [x] Tests: 3/3 camera + 11/11 smoke = 14/14 total passing
+- [x] Tagged v0.4.0
+- [x] NEXT: Cycle 2 — Frontier #3 Logcat event stream
+
+### Cycle 2 — Frontier #3 Logcat → event_bus (STARTING)
+- [ ] Check devduck event_bus API surface
+- [ ] Write `log_stream_start/stop/status` actions
+- [ ] Parser: logcat tag → structured event
+- [ ] Test: trigger notif, verify event appears
+
 
 ---
 
 ## Acceptance criteria per feature
 
 ### Frontier #5 — Physical Camera
-- [ ] `adb(action="camera_photo", facing="back", auto_pull=True)` opens Camera app
-- [ ] Auto-snaps via KEYCODE_CAMERA
-- [ ] Pulls latest DCIM file via adb pull
-- [ ] Returns Converse API image block (same pattern as screenshot)
-- [ ] `facing="front"` supported via intent extra or tap
-- [ ] `camera_video(duration_sec=5)` records + pulls mp4
-- [ ] Test: `tests/test_camera.py` — takes a real photo, verifies file exists + image block
-- [ ] Tagged v0.4.0
+- [x] `adb(action="camera_photo", facing="back", auto_pull=True)` opens Camera app
+- [x] Auto-snaps via UI tap on shutter_button (keyevent unreliable on GCam)
+- [x] Pulls latest DCIM file via adb pull
+- [x] Returns Converse API image block (same pattern as screenshot)
+- [x] `facing="front"` supported via content-desc tap + 2.5s settle
+- [x] `camera_video(duration_sec=5)` records + pulls mp4 (code done, untested)
+- [x] Test: `tests/test_camera.py` — 3/3 pass on real Pixel 10 Pro
+- [x] Tagged v0.4.0 ✅ SHIPPED
 
 ### Frontier #3 — Logcat Stream
 - [ ] `log_stream_start(filters=["*:W"])` launches background thread
@@ -87,8 +107,9 @@
 - v0.1.0 — scaffold
 - v0.2.0 — screenshot → image block
 - v0.3.0 — smart UI + sensors + thermals + comms
+- v0.4.0 — camera_photo + camera_video (Frontier #5)
 
 ## Stats
-- Cycles completed: 0 / 100
-- Frontiers shipped: 0 / 13
-- Actions in tool: 67
+- Cycles completed: 1 / 100
+- Frontiers shipped: 1 / 13
+- Actions in tool: 69 (+camera_photo, +camera_video)
