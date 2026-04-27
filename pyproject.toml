@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strands-adb"
+version = "0.18.0"
+description = "@tool decorated Android control for Strands Agents"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "cagataycali"}]
+license = {text = "MIT"}
+keywords = ["strands", "agent", "android", "adb", "devduck", "llm-tools"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+  "strands-agents",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-asyncio", "ruff", "mypy"]
+vision = ["Pillow>=10"]
+
+[project.urls]
+Homepage = "https://github.com/cagataycali/strands-adb"
+Issues = "https://github.com/cagataycali/strands-adb/issues"
+
+[tool.setuptools.packages.find]
+include = ["strands_adb*"]
+
+[tool.ruff]
+line-length = 100

@@ -1,0 +1,102 @@
+site_name: Strands ADB
+site_url: https://cagataycali.github.io/strands-adb
+site_description: "@tool decorated Android control for Strands Agents — drive any adb-connected device from your agent."
+repo_url: https://github.com/cagataycali/strands-adb
+repo_name: cagataycali/strands-adb
+extra_css:
+  - stylesheets/extra.css?v=1
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quickstart: getting-started/quickstart.md
+    - Connect a Device: getting-started/connect.md
+  - Guide:
+    - Actions Overview: guide/actions.md
+    - Vision (Screenshots): guide/vision.md
+    - UI Automation: guide/ui-automation.md
+    - Smart Tap: guide/smart-tap.md
+    - Apps & Intents: guide/apps-intents.md
+    - Camera: guide/camera.md
+    - Sensors & Thermals: guide/sensors.md
+    - Settings Mutation: guide/settings.md
+    - Logcat Streaming: guide/logcat.md
+    - Accessibility: guide/accessibility.md
+    - DevDuck Integration: guide/devduck.md
+    - SSH / Wireless ADB: guide/ssh.md
+    - Safety: guide/safety.md
+  - Examples:
+    - Overview: examples/overview.md
+    - WhatsApp Assistant: examples/whatsapp.md
+    - Notification Triage: examples/notifications.md
+    - Screen Reader: examples/screen-reader.md
+    - Autonomous Phone Agent: examples/autonomous.md
+  - Architecture: architecture.md
+  - API Reference: api-reference.md
+theme:
+  name: material
+  logo: strands-adb-logo.svg
+  favicon: strands-adb-logo.svg
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - scheme: default
+      primary: white
+      accent: green
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: black
+      accent: green
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - navigation.top
+    - navigation.tracking
+    - search.suggest
+    - search.highlight
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format ''
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - pymdownx.betterem
+  - pymdownx.mark
+  - pymdownx.caret
+  - pymdownx.tilde
+  - pymdownx.keys
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji ''
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg ''
+  - attr_list
+  - md_in_html
+  - tables
+  - def_list
+  - footnotes
+  - toc:
+      permalink: true
+plugins:
+  - search
