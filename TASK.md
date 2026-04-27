@@ -85,11 +85,25 @@
 - [x] Tagged v0.6.0
 - [x] NEXT: Cycle 4 — Frontier #10 (UI query DSL) OR #2 (touch-streaming for uiautomator replacement)
 
-### Cycle 4 — Frontier #10 UI Query DSL (STARTING)
-- [ ] `ui_find(text=..., resource_id=..., class_=..., clickable=True)` → coords
-- [ ] `ui_tap_by(text=...)` one-shot convenience
-- [ ] Wait-for semantics: `ui_wait_for(text=..., timeout=5)`
-- [ ] Tests against known on-screen elements
+### Cycle 4 — Frontier #10 UI Query DSL (DONE)
+- [x] `ui_find` with 7 composable filters (text, resource_id, class_name,
+  desc_filter, clickable_filter, scrollable_filter, package)
+- [x] `ui_tap_by` — find + tap (defaults clickable=True)
+- [x] `ui_wait_for` — polling with configurable timeout + interval
+- [x] Three matcher modes: substring / '=exact' / '^regex'
+- [x] text filter falls back to content-desc (for icon buttons)
+- [x] Pure stdlib (xml.etree.ElementTree)
+- [x] Replaced legacy ui_find/smart_tap → renamed to _legacy
+- [x] 11 new tests (unit + live) all passing
+- [x] Bonus: camera tests auto-skip when device locked
+- [x] Tagged v0.7.0
+- [x] NEXT: Cycle 5 — Frontier #2 (touch/gesture streaming) OR #4 (screen video → CV)
+
+### Cycle 5 — Frontier #4 Screen Video → CV (STARTING)
+- [ ] `screen_record_loop(duration, output)` → collect frames
+- [ ] `screen_frames(n=10)` extract snapshot frames from screenrecord
+- [ ] Integration: feed frames into image_reader block for visual reasoning
+- [ ] Tests
 
 
 ---
@@ -135,8 +149,9 @@
 - v0.4.0 — camera_photo + camera_video (Frontier #5)
 - v0.5.0 — logcat event stream → event_bus (Frontier #3)
 - v0.6.0 — settings mutation + presets (Frontier #13)
+- v0.7.0 — UI query DSL (Frontier #10)
 
 ## Stats
-- Cycles completed: 3 / 100
-- Frontiers shipped: 3 / 13
-- Actions in tool: 81 (+9 settings: setting_get/put/delete/list/dump, set_ringer/brightness/bluetooth/airplane_mode)
+- Cycles completed: 4 / 100
+- Frontiers shipped: 4 / 13
+- Actions in tool: 84 (+3 UI DSL: ui_find, ui_tap_by, ui_wait_for)
