@@ -99,10 +99,21 @@
 - [x] Tagged v0.7.0
 - [x] NEXT: Cycle 5 — Frontier #2 (touch/gesture streaming) OR #4 (screen video → CV)
 
-### Cycle 5 — Frontier #4 Screen Video → CV (STARTING)
-- [ ] `screen_record_loop(duration, output)` → collect frames
-- [ ] `screen_frames(n=10)` extract snapshot frames from screenrecord
-- [ ] Integration: feed frames into image_reader block for visual reasoning
+### Cycle 5 — Frontier #4 Screen Frames → CV (DONE)
+- [x] `screen_frames(n, interval)` — live snapshot stream via screencap
+- [x] `video_frames(mp4, n)` — ffmpeg extraction, single-pass via -vf fps=N/duration
+- [x] Both return Converse image blocks (agent SEES the pixels)
+- [x] Robust duration probe (format + stream fallback)
+- [x] Handles variable-fps screenrecord mp4s (where per-frame seek fails)
+- [x] Graceful ffmpeg-missing handling
+- [x] 10 new tests (5 screen_frames + 5 video_frames)
+- [x] Tagged v0.8.0
+- [x] NEXT: Cycle 6 — Frontier #2 touch/gesture streaming OR #8 accessibility/ATC
+
+### Cycle 6 — Frontier #2 Touch/Gesture Streaming (STARTING)
+- [ ] `sendevent` hot-path → raw kernel touch events (no uiautomator)
+- [ ] Macro recording: capture live touches → replay
+- [ ] Multi-finger gestures: pinch, rotate
 - [ ] Tests
 
 
@@ -150,8 +161,9 @@
 - v0.5.0 — logcat event stream → event_bus (Frontier #3)
 - v0.6.0 — settings mutation + presets (Frontier #13)
 - v0.7.0 — UI query DSL (Frontier #10)
+- v0.8.0 — screen frames → agent vision (Frontier #4)
 
 ## Stats
-- Cycles completed: 4 / 100
-- Frontiers shipped: 4 / 13
-- Actions in tool: 84 (+3 UI DSL: ui_find, ui_tap_by, ui_wait_for)
+- Cycles completed: 5 / 100
+- Frontiers shipped: 5 / 13
+- Actions in tool: 86 (+2 frames: screen_frames, video_frames)
