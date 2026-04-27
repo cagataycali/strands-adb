@@ -205,10 +205,29 @@
       Pick: Frontier #8 — battery statistics + power profiling
       (dumpsys battery/batterystats, cpuset, power manager)
 
-### Cycle 12 — Frontier #8 Power & Battery (STARTING)
-- [ ] `power_status` — battery level/temp/voltage/charging
-- [ ] `power_stats` — top power consumers per-UID
-- [ ] `power_thermal` — thermal throttling state
+### Cycle 12 — Frontier #8 Power & Battery (DONE)
+- [x] power_status: level/temp/voltage/charging/health/plug source
+      w/ decoded enums (charging/discharging/full, good/overheat/cold)
+- [x] power_thermal: overall status + per-zone temps (66 sensors)
+      w/ highlights: battery/skin/cpu_big/mid/little/tpu/gpu
+- [x] power_consumers(top=N): top UIDs by mAh w/ package resolution
+      via 2-pass fetch (human + --checkin for UID→pkg mapping)
+- [x] power_subsystems: global breakdown (screen/cpu/wifi/cell/...)
+- [x] 15 new tests — live validated on Pixel 10 Pro charging:
+      • 74% at 32.6°C 4.213V
+      • CPU BIG=83°C (expected while charging)
+      • Top consumer = mobile_radio at 944 mAh (4d runtime)
+      • 186 UIDs total, packages resolved for top-3
+- [x] Fixed 'status' key collision (renamed → battery_status/thermal_status)
+- [x] Tagged v0.15.0
+- [x] NEXT: Cycle 13 — 12/13 frontiers complete → pick final one!
+      Remaining: Frontier #13 — Security (keychain, VPN, TLS inspection)
+
+### Cycle 13 — Frontier #13 Security (STARTING)
+- [ ] `security_vpn_status` — VPN state
+- [ ] `security_credentials` — keychain/credstore stats (meta only)
+- [ ] `security_device_admin` — device admin apps
+- [ ] `security_verified_boot` — verified boot state
 - [ ] Tests
 
 
@@ -263,8 +282,9 @@
 - v0.12.0 — media session & AVRCP (Frontier #5)
 - v0.13.0 — connectivity (Frontier #7)
 - v0.14.0 — sensor feeds (Frontier #12)
+- v0.15.0 — power & battery (Frontier #8)
 
 ## Stats
-- Cycles completed: 11 / 100
-- Frontiers shipped: 11 / 13
-- Actions in tool: 124 (+3 sensors: sensors_list/sensors_recent/sensor_get)
+- Cycles completed: 12 / 100
+- Frontiers shipped: 12 / 13 (92%)
+- Actions in tool: 128 (+4 power: power_status/thermal/consumers/subsystems)
