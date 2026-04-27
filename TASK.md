@@ -189,11 +189,27 @@
 - [x] NEXT: Cycle 11 — Frontier #12 Sensor feeds (dumpsys sensorservice,
       accelerometer/gyro/magnetometer/proximity/light snapshots)
 
-### Cycle 11 — Frontier #12 Sensor Feeds (STARTING)
-- [ ] `sensors_list` — enumerate available sensors
-- [ ] `sensor_snapshot` — one-shot read via dumpsys + recent events
-- [ ] `sensor_stream_start/stop` — continuous sampling (background)
-- [ ] Tests (unit parsers + live snapshot)
+### Cycle 11 — Frontier #12 Sensor Feeds (DONE)
+- [x] sensors_list: 30 sensors w/ min/max rates, reporting mode, wake-up
+- [x] sensors_recent: recent events across all active sensors
+- [x] sensor_get: latest reading by name/alias/type_id with labels
+- [x] 30+ sensor aliases (accel/accelerometer, gyro/gyroscope, prox, lux, etc.)
+- [x] Semantic labels: accel→{x,y,z}, light→{lux}, prox→{distance},
+      pressure→{hPa}, rotation→{x,y,z,w}, orientation→{azimuth,pitch,roll}
+- [x] Prefers calibrated > uncalibrated primary > wake-up variant
+- [x] Live validated: |g|=9.812 on flat phone, lux=66.32, prox=5cm
+- [x] Parser handles on-change (minRate only) vs continuous (min+max)
+- [x] 17 new tests
+- [x] Tagged v0.14.0
+- [x] NEXT: Cycle 12 — Frontier #13 Keychain & VPN? or #8 Power?
+      Pick: Frontier #8 — battery statistics + power profiling
+      (dumpsys battery/batterystats, cpuset, power manager)
+
+### Cycle 12 — Frontier #8 Power & Battery (STARTING)
+- [ ] `power_status` — battery level/temp/voltage/charging
+- [ ] `power_stats` — top power consumers per-UID
+- [ ] `power_thermal` — thermal throttling state
+- [ ] Tests
 
 
 ---
@@ -246,8 +262,9 @@
 - v0.11.0 — notification pipeline (Frontier #11)
 - v0.12.0 — media session & AVRCP (Frontier #5)
 - v0.13.0 — connectivity (Frontier #7)
+- v0.14.0 — sensor feeds (Frontier #12)
 
 ## Stats
-- Cycles completed: 10 / 100
-- Frontiers shipped: 10 / 13
-- Actions in tool: 121 (+10 connectivity: wifi_status/enable/scan/list_saved/connect/forget, bt_status/enable, airplane_mode_get/set)
+- Cycles completed: 11 / 100
+- Frontiers shipped: 11 / 13
+- Actions in tool: 124 (+3 sensors: sensors_list/sensors_recent/sensor_get)
