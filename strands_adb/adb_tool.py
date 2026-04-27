@@ -1797,6 +1797,258 @@ def _handle_ui_wait_for(
     }
 
 
+
+
+# =============================================================================
+# 🎬  Screen Frames → CV  (Frontier #4)
+# =============================================================================
+#
+# Turn the stream of pixels on the phone into first-class agent vision.
+#
+# Two complementary strategies:
+#
+#   A) screen_frames  — Fast live snapshots. Take N screencaps in sequence,
+#                       each ~600ms apart. Good for seeing "what's happening
+#                       right now" without recording a video.
+#
+#   B) video_frames   — Extract N evenly-spaced frames from an existing mp4
+#                       via ffmpeg. Good for replay / understanding a past
+#                       interaction captured with screen_record.
+#
+# Both actions return Converse-API image blocks so the agent literally sees
+# the pixels, not just paths.
+
+import shutil as _shutil
+
+
+def _which_ffmpeg() -> Optional[str]:
+    """Find ffmpeg binary. Returns None if not installed."""
+    return _shutil.which("ffmpeg")
+
+
+def _capture_one_png(serial: Optional[str]) -> Optional[bytes]:
+    """Grab a single screencap PNG via `adb exec-out`. Returns raw bytes or None."""
+    cmd = [_adb_bin()]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += ["exec-out", "screencap", "-p"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=15)
+        if res.returncode != 0 or not res.stdout:
+            return None
+        return res.stdout
+    except Exception:
+        return None
+
+
+def _handle_screen_frames(
+    n: int,
+    interval_sec: float,
+    include_image: bool,
+    output_dir: Optional[str],
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """Capture N screen frames at fixed interval → image blocks + files.
+
+    Each frame is saved to output_dir (or /tmp) as frame_NN.png.
+    Image blocks are included so the agent can see each frame inline.
+    """
+    if n < 1 or n > 30:
+        return _err(f"n must be 1..30, got {n}")
+    if interval_sec < 0 or interval_sec > 10:
+        return _err(f"interval_sec must be 0..10, got {interval_sec}")
+
+    base = Path(output_dir or f"/tmp/adb_frames_{int(time.time())}")
+    base.mkdir(parents=True, exist_ok=True)
+
+    s = serial or _SELECTED_SERIAL
+    started = time.time()
+    captured: List[Dict[str, Any]] = []
+    content: List[Dict[str, Any]] = []
+
+    for i in range(n):
+        if i > 0 and interval_sec > 0:
+            time.sleep(interval_sec)
+        t_start = time.time()
+        png = _capture_one_png(s)
+        if png is None:
+            content.append(
+                {"text": f"❌ frame {i}: screencap failed, skipping"}
+            )
+            continue
+
+        path = base / f"frame_{i:02d}.png"
+        path.write_bytes(png)
+        captured.append({
+            "index": i,
+            "path": str(path),
+            "size_bytes": len(png),
+            "capture_time": t_start - started,
+        })
+
+    # Build content: summary header then alternating text + image blocks
+    total_time = time.time() - started
+    summary = (
+        f"🎬 captured {len(captured)}/{n} frame(s) over {total_time:.1f}s "
+        f"at {interval_sec}s intervals → {base}"
+    )
+    content.insert(0, {"text": summary})
+
+    if include_image:
+        for frame in captured:
+            png = Path(frame["path"]).read_bytes()
+            content.append({"text": f"Frame {frame['index']} (t={frame['capture_time']:.1f}s):"})
+            content.append(
+                {"image": {"format": "png", "source": {"bytes": png}}}
+            )
+
+    return {
+        "status": "success",
+        "content": content,
+        "frames": captured,
+        "count": len(captured),
+        "output_dir": str(base),
+        "total_time_sec": total_time,
+    }
+
+
+def _handle_video_frames(
+    video_path: str,
+    n: int,
+    include_image: bool,
+    output_dir: Optional[str],
+) -> Dict[str, Any]:
+    """Extract N evenly-spaced frames from an existing video via ffmpeg."""
+    if not _which_ffmpeg():
+        return _err(
+            "ffmpeg not found in PATH — install with `brew install ffmpeg` "
+            "or `apt install ffmpeg`. Alternatively, use screen_frames for "
+            "live captures without ffmpeg."
+        )
+
+    vp = Path(video_path).expanduser()
+    if not vp.exists():
+        return _err(f"video not found: {vp}")
+
+    if n < 1 or n > 30:
+        return _err(f"n must be 1..30, got {n}")
+
+    base = Path(output_dir or f"/tmp/adb_video_frames_{int(time.time())}")
+    base.mkdir(parents=True, exist_ok=True)
+
+    # Probe duration. Try multiple strategies because Android screenrecord
+    # sometimes writes files without format-level duration metadata.
+    def _probe_duration(path: str) -> float:
+        strategies = [
+            # Format-level (most accurate when present)
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            # Stream-level fallback
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+        ]
+        for cmd in strategies:
+            try:
+                res = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=10
+                )
+                val = (res.stdout or "").strip()
+                if val and val not in ("N/A", "0.000000"):
+                    try:
+                        d = float(val)
+                        if d > 0:
+                            return d
+                    except ValueError:
+                        pass
+            except Exception:
+                continue
+        return 0.0
+
+    duration = _probe_duration(str(vp))
+    if duration <= 0:
+        return _err(
+            f"could not probe duration of {vp} — file may be corrupt / "
+            f"too short. screenrecord needs ~3s minimum to produce "
+            f"valid mp4."
+        )
+
+    # N evenly-spaced timestamps (avoid exact 0 and end to avoid empty/black frames)
+    if n == 1:
+        timestamps = [duration / 2]
+    else:
+        margin = duration * 0.05  # skip first/last 5%
+        usable = duration - 2 * margin
+        timestamps = [margin + usable * i / (n - 1) for i in range(n)]
+
+    extracted: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    # Single-pass extraction: `-vf fps=N/duration` emits N evenly-spaced
+    # frames across the full video in one ffmpeg invocation. Far more
+    # robust than per-frame seeking on Android screenrecord outputs which
+    # often have broken keyframe indexes past the first few seconds.
+    out_pattern = str(base / "frame_%02d.png")
+    fps_filter = f"fps={n}/{duration:.3f}"
+    cmd = [
+        "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+        "-i", str(vp),
+        "-vf", fps_filter,
+        "-frames:v", str(n),
+        "-q:v", "2",
+        out_pattern,
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0:
+            errors.append(f"ffmpeg exit {res.returncode}: {(res.stderr or '')[:200]}")
+    except subprocess.TimeoutExpired:
+        errors.append("ffmpeg timeout after 60s")
+    except Exception as e:
+        errors.append(f"ffmpeg exception: {e}")
+
+    # Collect what actually got produced (may be fewer than n if video is short)
+    # ffmpeg numbers from 01, not 00
+    for i in range(1, n + 1):
+        frame_path = base / f"frame_{i:02d}.png"
+        if frame_path.exists() and frame_path.stat().st_size > 0:
+            # Approximate timestamp: i-th frame of n spread over duration
+            ts_approx = (i - 0.5) * (duration / n)
+            extracted.append({
+                "index": i - 1,  # 0-based external
+                "timestamp_sec": ts_approx,
+                "path": str(frame_path),
+                "size_bytes": frame_path.stat().st_size,
+            })
+
+    summary = (
+        f"🎬 extracted {len(extracted)}/{n} frame(s) from {vp.name} "
+        f"(duration={duration:.1f}s) → {base}"
+    )
+    if errors:
+        summary += f" ({len(errors)} error(s))"
+    content: List[Dict[str, Any]] = [{"text": summary}]
+
+    if include_image:
+        for f in extracted:
+            png = Path(f["path"]).read_bytes()
+            # PNG format for Converse API
+            content.append({"text": f"Frame {f['index']} @ {f['timestamp_sec']:.1f}s:"})
+            content.append(
+                {"image": {"format": "png", "source": {"bytes": png}}}
+            )
+
+    return {
+        "status": "success",
+        "content": content,
+        "frames": extracted,
+        "count": len(extracted),
+        "output_dir": str(base),
+        "video_duration_sec": duration,
+        "errors": errors,
+    }
+
+
 ACTIONS = {
     # device
     "list_devices", "select_device", "device_info", "battery", "wake", "unlock",
@@ -1832,6 +2084,8 @@ ACTIONS = {
     "set_airplane_mode",
     # UI query DSL (v0.7.0)
     "ui_find", "ui_tap_by", "ui_wait_for",
+    # Screen frames / CV (v0.8.0)
+    "screen_frames", "video_frames",
 }
 
 
@@ -1893,6 +2147,10 @@ def adb(
     ui_index: int = 0,
     ui_timeout: float = 5.0,
     ui_poll_interval: float = 0.5,
+    # Screen frames / CV (v0.8.0)
+    frames_n: int = 5,
+    frames_interval: float = 0.5,
+    frames_output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -1923,6 +2181,11 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Frames:  screen_frames (frames_n=5, frames_interval=0.5, output_path=dir)
+                     → N live screencaps as image blocks.
+                     video_frames (output_path=<mp4>, frames_n=5)
+                     → extract N evenly-spaced frames from video via ffmpeg.
+                     Both return Converse image blocks so agent SEES pixels.
             UI DSL:  ui_find, ui_tap_by, ui_wait_for — filters: text, resource_id,
                      class_name, desc_filter (content-desc), clickable_filter,
                      scrollable_filter, package. Matchers: "foo" substring,
@@ -2123,6 +2386,20 @@ def adb(
             return _handle_ui_wait_for(
                 serial, text, resource_id, class_name, desc_filter,
                 clickable_filter, package, ui_timeout, ui_poll_interval,
+            )
+
+        # Screen frames / CV (v0.8.0)
+        if action == "screen_frames":
+            return _handle_screen_frames(
+                frames_n, frames_interval, include_image,
+                output_path, serial,
+            )
+        if action == "video_frames":
+            if not output_path:
+                return _err("video_frames requires output_path=<video_path>")
+            return _handle_video_frames(
+                output_path, frames_n, include_image,
+                frames_output_dir,
             )
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
