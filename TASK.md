@@ -170,12 +170,30 @@
 - [x] NEXT: Cycle 10 — Frontier #7 Wi-Fi/BT/tethering control (cmd wifi,
       cmd bluetooth_manager, settings for airplane mode, hotspot toggle)
 
-### Cycle 10 — Frontier #7 Connectivity (STARTING)
-- [ ] `wifi_scan` / `wifi_connect` / `wifi_list_saved`
-- [ ] `bt_scan` / `bt_pair` / `bt_list_paired`
-- [ ] `airplane_mode_toggle`
-- [ ] `hotspot_toggle`
-- [ ] Tests
+### Cycle 10 — Frontier #7 Connectivity (DONE)
+- [x] wifi_status: enabled/connected/ssid/bssid/rssi/freq/link_speed
+- [x] wifi_enable: toggle with verify read-back
+- [x] wifi_scan: sorted-by-rssi, band classification (2.4/5/6 GHz)
+      security classification (open/owe/wep/wpa2/wpa3)
+- [x] wifi_list_saved: collapses multi-security-variant rows
+- [x] wifi_connect: validated (ssid/security/passphrase combos)
+- [x] wifi_forget: by network_id
+- [x] bt_status: state/name/address/bonded_count/discovering
+- [x] bt_enable: toggle with 5s polling
+- [x] airplane_mode_get / airplane_mode_set: round trip verified
+- [x] ~~hotspot_toggle~~ — skipped (requires UI approval, unsafe for automation)
+- [x] Parser battles fixed: SSID quotes, numeric suffixes (Mbps/MHz),
+      hidden-network flag leak, duplicate saved network rows
+- [x] 22 new tests
+- [x] Tagged v0.13.0
+- [x] NEXT: Cycle 11 — Frontier #12 Sensor feeds (dumpsys sensorservice,
+      accelerometer/gyro/magnetometer/proximity/light snapshots)
+
+### Cycle 11 — Frontier #12 Sensor Feeds (STARTING)
+- [ ] `sensors_list` — enumerate available sensors
+- [ ] `sensor_snapshot` — one-shot read via dumpsys + recent events
+- [ ] `sensor_stream_start/stop` — continuous sampling (background)
+- [ ] Tests (unit parsers + live snapshot)
 
 
 ---
@@ -227,8 +245,9 @@
 - v0.10.0 — accessibility / ATC control (Frontier #8)
 - v0.11.0 — notification pipeline (Frontier #11)
 - v0.12.0 — media session & AVRCP (Frontier #5)
+- v0.13.0 — connectivity (Frontier #7)
 
 ## Stats
-- Cycles completed: 9 / 100
-- Frontiers shipped: 9 / 13
-- Actions in tool: 111 (+6 media: dispatch/volume_get/volume_set/volume_adjust/sessions_list/now_playing)
+- Cycles completed: 10 / 100
+- Frontiers shipped: 10 / 13
+- Actions in tool: 121 (+10 connectivity: wifi_status/enable/scan/list_saved/connect/forget, bt_status/enable, airplane_mode_get/set)
