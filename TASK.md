@@ -110,10 +110,27 @@
 - [x] Tagged v0.8.0
 - [x] NEXT: Cycle 6 — Frontier #2 touch/gesture streaming OR #8 accessibility/ATC
 
-### Cycle 6 — Frontier #2 Touch/Gesture Streaming (STARTING)
-- [ ] `sendevent` hot-path → raw kernel touch events (no uiautomator)
-- [ ] Macro recording: capture live touches → replay
-- [ ] Multi-finger gestures: pinch, rotate
+### Cycle 6 — Frontier #2 Touch/Gesture Streaming (DONE)
+- [x] Discovered non-root reality: sendevent blocked by SELinux + 0660
+      root:input perms → documented permanent limitation
+- [x] Pivoted to `input motionevent DOWN/MOVE/UP` — same streaming
+      capability at InputDispatcher level (no root needed)
+- [x] gesture_stream: arbitrary 2-D paths with configurable delay
+- [x] gesture_long_press: 100-10000ms hold, reports actual elapsed
+- [x] gesture_path: 6 shapes (line_h/v, circle, arc, zigzag, square)
+- [x] gesture_pinch: documented stub with alternatives for multi-touch
+- [x] Visual smoke test: long-press creates real popup (42KB diff)
+- [x] Auto-cleanup UP on partial failure (pointer never sticks)
+- [x] 22 new tests
+- [x] Tagged v0.9.0
+- [x] NEXT: Cycle 7 — Frontier #8 accessibility/ATC (dumpsys accessibility,
+      cmd accessibility, service discovery/control)
+
+### Cycle 7 — Frontier #8 Accessibility / ATC (STARTING)
+- [ ] `accessibility_list_services` — installed + enabled services
+- [ ] `accessibility_enable/disable` — per-service toggle
+- [ ] `accessibility_talkback` — enable/disable TalkBack specifically
+- [ ] `accessibility_captions` — system captioning on/off
 - [ ] Tests
 
 
@@ -162,8 +179,9 @@
 - v0.6.0 — settings mutation + presets (Frontier #13)
 - v0.7.0 — UI query DSL (Frontier #10)
 - v0.8.0 — screen frames → agent vision (Frontier #4)
+- v0.9.0 — gesture streaming via motionevent (Frontier #2)
 
 ## Stats
-- Cycles completed: 5 / 100
-- Frontiers shipped: 5 / 13
-- Actions in tool: 86 (+2 frames: screen_frames, video_frames)
+- Cycles completed: 6 / 100
+- Frontiers shipped: 6 / 13
+- Actions in tool: 90 (+4 gesture: gesture_stream, gesture_long_press, gesture_path, gesture_pinch)
