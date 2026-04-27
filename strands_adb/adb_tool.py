@@ -2666,6 +2666,487 @@ def _handle_accessibility_status(serial: Optional[str]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# 📐  Sensor Feeds  (Frontier #12)
+# =============================================================================
+#
+# Agents read phone sensors — accelerometer, gyro, magnetometer, proximity,
+# ambient light, barometer, gravity, rotation — from `dumpsys sensorservice`.
+# No root, no companion app, no JNI. Just parse the text dump.
+#
+# Output structure of `dumpsys sensorservice`:
+#
+#   Sensor Device:
+#   Total N h/w sensors, N running 0 disabled clients:
+#   0xHANDLE) active-count = M; sampling_period(ms) = {...}, ...
+#
+#   Sensor List:
+#   0xHANDLE) NAME                    | VENDOR | ver: V |
+#            type: android.sensor.X(TYPE_ID) | perm: ... | flags: 0xNNNN
+#            continuous | minRate=... | maxRate=... | ...
+#
+#   Recent Sensor events:
+#   SENSOR NAME: last N events
+#       i (ts=SECONDS.NS, wall=HH:MM:SS.mmm) v1, v2, v3, ...,
+#
+# The sensor TYPE_ID after android.sensor.X is the canonical Android
+# Sensor.TYPE_* constant (Sensor.TYPE_ACCELEROMETER=1, TYPE_GYROSCOPE=4
+# etc). We use that for aliasing.
+
+# Canonical Android Sensor.TYPE_* constants (from Android source)
+# https://developer.android.com/reference/android/hardware/Sensor#TYPE_ACCELEROMETER
+SENSOR_TYPE_ALIASES: Dict[str, int] = {
+    # Most-used motion sensors
+    "accelerometer":           1,
+    "accel":                   1,
+    "magnetic_field":          2,
+    "magnetometer":            2,
+    "mag":                     2,
+    "orientation":             3,
+    "gyroscope":               4,
+    "gyro":                    4,
+    "light":                   5,
+    "lux":                     5,
+    "ambient_light":           5,
+    "pressure":                6,
+    "barometer":               6,
+    "proximity":               8,
+    "prox":                    8,
+    "gravity":                 9,
+    "linear_acceleration":    10,
+    "linear_accel":           10,
+    "rotation_vector":        11,
+    "rotation":               11,
+    "relative_humidity":      12,
+    "humidity":               12,
+    "ambient_temperature":    13,
+    "temperature":            13,
+    "magnetic_field_uncalibrated": 14,
+    "game_rotation_vector":   15,
+    "gyroscope_uncalibrated": 16,
+    "gyro_uncal":             16,
+    "significant_motion":     17,
+    "step_detector":          18,
+    "step_counter":           19,
+    "geomagnetic_rotation_vector": 20,
+    "heart_rate":             21,
+    "accelerometer_uncalibrated": 35,
+    "accel_uncal":            35,
+    "hinge_angle":            36,
+    # Values per sample for output formatting (for nice "x, y, z" display)
+}
+
+# Sensors whose values are vectors of known dimension (for labels)
+SENSOR_VALUE_LABELS: Dict[int, List[str]] = {
+    1:  ["x", "y", "z"],                        # accelerometer m/s²
+    2:  ["x", "y", "z"],                        # magnetometer μT
+    3:  ["azimuth", "pitch", "roll"],           # orientation deg
+    4:  ["x", "y", "z"],                        # gyro rad/s
+    5:  ["lux"],                                # light
+    6:  ["hPa"],                                # barometer
+    8:  ["distance"],                           # proximity cm
+    9:  ["x", "y", "z"],                        # gravity m/s²
+    10: ["x", "y", "z"],                        # linear accel m/s²
+    11: ["x", "y", "z", "w"],                   # rotation vector
+    12: ["percent"],                            # humidity
+    13: ["celsius"],                            # temperature
+    14: ["x", "y", "z", "bias_x", "bias_y", "bias_z"],
+    15: ["x", "y", "z", "w"],
+    16: ["x", "y", "z", "bias_x", "bias_y", "bias_z"],
+    19: ["steps"],
+    21: ["bpm"],
+    35: ["x", "y", "z", "bias_x", "bias_y", "bias_z"],
+    36: ["angle"],
+}
+
+
+def _resolve_sensor_type(query: Any) -> Optional[int]:
+    """Resolve a sensor name/alias/type_id to an Android Sensor.TYPE_*.
+
+    Accepts: 'accelerometer', 'accel', 1, '1', 'gyro', ...
+    """
+    if isinstance(query, int):
+        return query if query > 0 else None
+    if not isinstance(query, str):
+        return None
+    low = query.lower().strip().replace("-", "_").replace(" ", "_")
+    # Direct alias
+    if low in SENSOR_TYPE_ALIASES:
+        return SENSOR_TYPE_ALIASES[low]
+    # Digit string
+    if low.isdigit():
+        n = int(low)
+        return n if n > 0 else None
+    return None
+
+
+def _parse_sensor_list(out: str) -> List[Dict[str, Any]]:
+    """Parse the 'Sensor List:' section of `dumpsys sensorservice`.
+
+    Each sensor is 2+ lines:
+      0xHANDLE) NAME | VENDOR | ver: V | type: android.sensor.X(TYPE_ID) | ...
+         continuous | minRate=Nhz | maxRate=Mhz | ... | (non-)wakeUp |
+    """
+    import re as _re
+    sensors: List[Dict[str, Any]] = []
+    lines = (out or "").splitlines()
+
+    # Find "Sensor List:" header
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "Sensor List:":
+            start = i + 1
+            break
+    if start is None:
+        return sensors
+
+    # Sensors continue until "Fusion States:", "Recent Sensor events:",
+    # or another top-level section header
+    end_markers = (
+        "Fusion States:", "Recent Sensor events:", "Active connections",
+        "Socket Buffer size", "Previous Registrations:",
+        "WakeLock Statistics:", "Mode:",
+    )
+
+    # Pattern for header line:
+    # 0x01010001) ICM45631 Accelerometer    | Invensense | ver: 1 | type: android.sensor.accelerometer(1) | perm: n/a | flags: 0xXXXX
+    hdr_re = _re.compile(
+        r"^\s*(0x[0-9a-fA-F]+)\)\s+"
+        r"(.+?)\s*\|\s*"
+        r"(.+?)\s*\|\s*"
+        r"ver:\s*(\d+)\s*\|\s*"
+        r"type:\s*android\.sensor\.([a-z_]+)\((\d+)\)\s*\|\s*"
+        r"perm:\s*([^|]*?)\s*\|\s*"
+        r"flags:\s*(0x[0-9a-fA-F]+)"
+    )
+    # Pattern for detail line. Both of these shapes exist:
+    #   "continuous | minRate=1.50Hz | maxRate=400.00Hz | ..."   (has both)
+    #   "on-change | minRate=1.00Hz | minDelay=0us | ..."        (minRate only)
+    # So parse each field independently.
+    min_rate_re = _re.compile(r"minRate=([0-9.]+)Hz")
+    max_rate_re = _re.compile(r"maxRate=([0-9.]+)Hz")
+
+    current: Optional[Dict[str, Any]] = None
+    for raw in lines[start:]:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(m) for m in end_markers):
+            break
+
+        m = hdr_re.match(raw)
+        if m:
+            if current:
+                sensors.append(current)
+            current = {
+                "handle": m.group(1),
+                "name": m.group(2).strip(),
+                "vendor": m.group(3).strip(),
+                "version": int(m.group(4)),
+                "type_name": m.group(5),
+                "type_id": int(m.group(6)),
+                "permission": m.group(7).strip(),
+                "flags": m.group(8),
+                "min_rate_hz": None,
+                "max_rate_hz": None,
+                "reporting_mode": None,
+                "wake_up": None,
+            }
+            continue
+
+        if current is None:
+            continue
+
+        # Detail line: parse rates (each independently), reporting mode, wake-up
+        mn = min_rate_re.search(raw)
+        if mn:
+            try: current["min_rate_hz"] = float(mn.group(1))
+            except ValueError: pass
+        mx = max_rate_re.search(raw)
+        if mx:
+            try: current["max_rate_hz"] = float(mx.group(1))
+            except ValueError: pass
+
+        # Reporting mode: first token before |
+        toks = [t.strip() for t in stripped.split("|")]
+        if toks and toks[0] in ("continuous", "on-change",
+                                 "one-shot", "special-trigger"):
+            current["reporting_mode"] = toks[0]
+        for t in toks:
+            if t == "wakeUp":
+                current["wake_up"] = True
+            elif t == "non-wakeUp":
+                current["wake_up"] = False
+
+    if current:
+        sensors.append(current)
+    return sensors
+
+
+def _parse_recent_events(out: str) -> Dict[str, Dict[str, Any]]:
+    """Parse the 'Recent Sensor events:' section.
+
+    Returns dict mapping sensor_name → {events: [...], latest: {...}}.
+    Each event has: {ts, wall, values}.
+
+    Section format:
+      Recent Sensor events:
+      ICM45631 Accelerometer: last 10 events
+           1 (ts=574.997002195, wall=23:34:07.521) 0.12, 0.26, 9.74, 0.00, ...
+           2 (ts=575.007027742, wall=23:34:07.527) 0.12, 0.27, 9.73, 0.00, ...
+      Device Orientation: last 2 events
+           1 (ts=10.096779952, wall=23:24:42.639) 0.00,
+    """
+    import re as _re
+    lines = (out or "").splitlines()
+
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "Recent Sensor events:":
+            start = i + 1
+            break
+    if start is None:
+        return {}
+
+    # End at next top-level section
+    end_markers = (
+        "Active connections", "Socket Buffer size",
+        "Previous Registrations:", "WakeLock Statistics:",
+        "Mode:", "Fusion States:",
+    )
+
+    # "SENSOR NAME: last N events"
+    header_re = _re.compile(r"^([^:]+?):\s*last\s+(\d+)\s+events\s*$")
+    # "   1 (ts=X.Y, wall=H:M:S.MS) v1, v2, v3, "
+    event_re = _re.compile(
+        r"^\s*(\d+)\s+\(ts=([\d.]+),\s*wall=([\d:.]+)\)\s*(.*?)\s*,?\s*$"
+    )
+
+    events: Dict[str, Dict[str, Any]] = {}
+    current_sensor: Optional[str] = None
+
+    for raw in lines[start:]:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(m) for m in end_markers):
+            break
+
+        hm = header_re.match(stripped)
+        if hm:
+            current_sensor = hm.group(1).strip()
+            events[current_sensor] = {
+                "sensor_name": current_sensor,
+                "max_events": int(hm.group(2)),
+                "events": [],
+                "latest": None,
+            }
+            continue
+
+        if current_sensor is None:
+            continue
+
+        em = event_re.match(raw)
+        if em:
+            try:
+                ts = float(em.group(2))
+            except ValueError:
+                continue
+            wall = em.group(3)
+            raw_vals = em.group(4).strip().rstrip(",")
+            # values are comma-separated floats; parse them
+            values: List[float] = []
+            for v in raw_vals.split(","):
+                v = v.strip()
+                if not v:
+                    continue
+                try:
+                    values.append(float(v))
+                except ValueError:
+                    pass
+            ev = {"ts": ts, "wall": wall, "values": values}
+            events[current_sensor]["events"].append(ev)
+            events[current_sensor]["latest"] = ev
+
+    return events
+
+
+def _label_values(type_id: int, values: List[float]) -> Dict[str, float]:
+    """Attach semantic labels to value vector (e.g. accel → {x, y, z})."""
+    labels = SENSOR_VALUE_LABELS.get(type_id, [])
+    result: Dict[str, float] = {}
+    for i, v in enumerate(values):
+        key = labels[i] if i < len(labels) else f"v{i}"
+        result[key] = v
+    return result
+
+
+# --- handlers ----------------------------------------------------------
+
+def _handle_sensors_list(serial: Optional[str]) -> Dict[str, Any]:
+    r = _run(
+        ["shell", "dumpsys", "sensorservice"],
+        serial=serial, timeout=15,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys sensorservice failed: {r['stderr'][:120]}")
+
+    sensors = _parse_sensor_list(r["stdout"] or "")
+
+    # Group by canonical type_name for summary
+    motion = [s for s in sensors if s["type_id"] in (1, 2, 4, 9, 10, 11)]
+    env = [s for s in sensors if s["type_id"] in (5, 6, 8, 12, 13)]
+    composite = [s for s in sensors if s["type_id"] in (3, 15, 20)]
+
+    lines = [f"📐 {len(sensors)} sensors available:"]
+    lines.append(f"   • motion: {len(motion)} (accel/gyro/mag/gravity/...)")
+    lines.append(f"   • environment: {len(env)} (light/prox/pressure/...)")
+    lines.append(f"   • composite: {len(composite)} (orientation/rotation/...)")
+
+    # Highlight common sensors
+    for query in ("accelerometer", "gyroscope", "light", "proximity"):
+        type_id = SENSOR_TYPE_ALIASES.get(query)
+        found = [s for s in sensors if s["type_id"] == type_id]
+        if found:
+            s = found[0]
+            lines.append(
+                f"   • {query:15s} → {s['name']!r} ({s['vendor']}, "
+                f"{s['min_rate_hz']}–{s['max_rate_hz']} Hz)"
+            )
+
+    return _ok(
+        "\n".join(lines),
+        sensors=sensors,
+        count=len(sensors),
+    )
+
+
+def _handle_sensors_recent(serial: Optional[str]) -> Dict[str, Any]:
+    """Snapshot of recent events across all active sensors."""
+    r = _run(
+        ["shell", "dumpsys", "sensorservice"],
+        serial=serial, timeout=15,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys sensorservice failed: {r['stderr'][:120]}")
+
+    events_by_sensor = _parse_recent_events(r["stdout"] or "")
+    # For nice labels, we also need the sensor list
+    sensors = _parse_sensor_list(r["stdout"] or "")
+    # Build name → type_id map (use HW sensor names as-is)
+    name_to_type: Dict[str, int] = {s["name"]: s["type_id"] for s in sensors}
+
+    # Attach labels
+    for sensor_name, bucket in events_by_sensor.items():
+        # Find matching type_id (fuzzy — sensorservice uses short names like
+        # "ICM45631 Accelerometer" but Sensor List has the same name)
+        type_id = name_to_type.get(sensor_name)
+        bucket["type_id"] = type_id
+        if bucket["latest"] and type_id is not None:
+            bucket["latest"]["labeled"] = _label_values(
+                type_id, bucket["latest"]["values"]
+            )
+
+    lines = [f"📐 {len(events_by_sensor)} sensors with recent events:"]
+    # Show latest value of key sensors
+    for sensor_name, bucket in list(events_by_sensor.items())[:12]:
+        latest = bucket.get("latest")
+        if not latest:
+            continue
+        vals = latest["values"][:4]
+        vals_str = ", ".join(f"{v:.3f}" for v in vals)
+        if len(latest["values"]) > 4:
+            vals_str += ", ..."
+        lines.append(
+            f"   [{latest['wall']}] {sensor_name[:30]:30s} → {vals_str}"
+        )
+
+    return _ok(
+        "\n".join(lines),
+        events=events_by_sensor,
+        sensor_count=len(events_by_sensor),
+    )
+
+
+def _handle_sensor_get(
+    sensor_query: Any, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Get the latest value for a specific sensor by name/alias/type_id."""
+    type_id = _resolve_sensor_type(sensor_query)
+    if type_id is None:
+        return _err(
+            f"unknown sensor {sensor_query!r}. Try one of: "
+            f"{sorted(SENSOR_TYPE_ALIASES.keys())[:15]}..."
+        )
+
+    r = _run(
+        ["shell", "dumpsys", "sensorservice"],
+        serial=serial, timeout=15,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys sensorservice failed: {r['stderr'][:120]}")
+
+    sensors = _parse_sensor_list(r["stdout"] or "")
+    events_by = _parse_recent_events(r["stdout"] or "")
+
+    # Find the sensor with matching type_id
+    matches = [s for s in sensors if s["type_id"] == type_id]
+    if not matches:
+        return _err(
+            f"sensor type_id={type_id} not available on this device"
+        )
+
+    # Prefer non-uncalibrated variant and non-wakeUp (primary)
+    matches.sort(key=lambda s: (
+        "uncalibrated" in s["name"].lower(),  # uncal last
+        bool(s.get("wake_up")),               # wake-up last
+    ))
+    sensor = matches[0]
+    name = sensor["name"]
+
+    # Find events for this sensor
+    bucket = events_by.get(name)
+    if not bucket or not bucket["events"]:
+        # Fallback: search by type_id in all events
+        for ename, ebucket in events_by.items():
+            # Match by canonical short name ("accelerometer" in "ICM… Accel…")
+            if sensor["type_name"].lower().replace("_", " ") in ename.lower():
+                bucket = ebucket
+                break
+
+    if not bucket or not bucket["events"]:
+        return _ok(
+            f"📐 {name}: no recent events (sensor may be inactive)",
+            sensor=sensor,
+            type_id=type_id,
+            latest=None,
+            events=[],
+        )
+
+    latest = bucket["events"][-1]
+    labeled = _label_values(type_id, latest["values"])
+    labels = SENSOR_VALUE_LABELS.get(type_id, [])
+
+    # Pretty format
+    if labels:
+        val_str = "  ".join(
+            f"{k}={v:+.3f}" for k, v in labeled.items()
+        )
+    else:
+        val_str = ", ".join(f"{v:.3f}" for v in latest["values"])
+
+    return _ok(
+        f"📐 {name} [{latest['wall']}] → {val_str}",
+        sensor=sensor,
+        type_id=type_id,
+        latest=latest,
+        labeled=labeled,
+        events=bucket["events"],
+        event_count=len(bucket["events"]),
+    )
+
+
+
+# =============================================================================
 # 📡  Connectivity: Wi-Fi, Bluetooth, Airplane Mode  (Frontier #7)
 # =============================================================================
 #
@@ -4050,6 +4531,8 @@ ACTIONS = {
     "wifi_list_saved", "wifi_connect", "wifi_forget",
     "bt_status", "bt_enable",
     "airplane_mode_get", "airplane_mode_set",
+    # Sensor feeds (v0.14.0)
+    "sensors_list", "sensors_recent", "sensor_get",
 }
 
 
@@ -4152,6 +4635,8 @@ def adb(
     wifi_scan_wait_sec: float = 4.0,
     bt_enabled: bool = True,
     airplane_enabled: bool = False,
+    # Sensor feeds (v0.14.0)
+    sensor_query: Any = None,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -4182,6 +4667,14 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Sensors: sensors_list → all 40+ sensors with rates, vendor,
+                     wake-up, reporting mode. Grouped motion/env/composite.
+                     sensors_recent → latest events across all active
+                     sensors (~10 events each), with labeled axes.
+                     sensor_get (sensor_query='accelerometer'|'gyro'|
+                     'light'|'proximity'|'pressure'|'gravity'|'rotation'|
+                     ...|type_id int) → latest reading with semantic
+                     labels ({x,y,z} for accel, {lux} for light, etc.).
             Connect: wifi_status → enabled/connected/ssid/rssi/frequency.
                      wifi_enable (wifi_enabled=True|False).
                      wifi_scan (wifi_scan_wait_sec=4.0) → list of {bssid,
@@ -4569,6 +5062,16 @@ def adb(
             return _handle_airplane_mode_get(serial)
         if action == "airplane_mode_set":
             return _handle_airplane_mode_set(airplane_enabled, serial)
+
+        # Sensor feeds (v0.14.0)
+        if action == "sensors_list":
+            return _handle_sensors_list(serial)
+        if action == "sensors_recent":
+            return _handle_sensors_recent(serial)
+        if action == "sensor_get":
+            if not sensor_query:
+                return _err("sensor_get requires sensor_query (e.g. 'accelerometer', 'gyro', 5)")
+            return _handle_sensor_get(sensor_query, serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
