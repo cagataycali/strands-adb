@@ -29,7 +29,7 @@
 ## Frontier implementation order (from priority matrix)
 1. ✅ **Frontier #5 — Physical camera** — SHIPPED v0.4.0
 2. ✅ **Frontier #3 — Logcat event stream → event_bus** — SHIPPED v0.5.0
-3. 🟢 **Frontier #13 — Settings mutation** ← NEXT
+3. ✅ **Frontier #13 — Settings mutation** — SHIPPED v0.6.0
 4. 🟢 **Frontier #1 — Sensor streams (polling mode)**
 5. 🟢 **Frontier #9 — Location (coarse via cell/wifi)**
 6. 🟢 **Frontier #10 — Multi-device fleet**
@@ -73,10 +73,23 @@
 - [x] Tagged v0.5.0
 - [x] NEXT: Cycle 3 — Frontier #13 Settings mutation
 
-### Cycle 3 — Frontier #13 Settings Mutation (STARTING)
-- [ ] `setting_get(namespace, key)` / `setting_put(namespace, key, value)`
-- [ ] Presets: airplane_mode, bluetooth, brightness, ringer
-- [ ] Tests
+### Cycle 3 — Frontier #13 Settings Mutation (DONE)
+- [x] `setting_get/put/delete/list` over system/secure/global
+- [x] `setting_dump` full 3-namespace snapshot
+- [x] Presets: set_ringer (silent/vibrate/normal), set_brightness (0..255),
+  set_bluetooth (svc bluetooth), set_airplane_mode (flag only, honest caveat)
+- [x] Every mutation verifies via round-trip read
+- [x] `_run_shell_capture` helper — subprocess wrapper with timeouts
+- [x] Validation: bad namespaces, out-of-range, bad ringer rejected
+- [x] 11 new tests all passing live on Pixel 10 Pro
+- [x] Tagged v0.6.0
+- [x] NEXT: Cycle 4 — Frontier #10 (UI query DSL) OR #2 (touch-streaming for uiautomator replacement)
+
+### Cycle 4 — Frontier #10 UI Query DSL (STARTING)
+- [ ] `ui_find(text=..., resource_id=..., class_=..., clickable=True)` → coords
+- [ ] `ui_tap_by(text=...)` one-shot convenience
+- [ ] Wait-for semantics: `ui_wait_for(text=..., timeout=5)`
+- [ ] Tests against known on-screen elements
 
 
 ---
@@ -106,7 +119,7 @@
 - [ ] Presets: `airplane_mode(on)`, `bluetooth(on)`, `brightness(0-255)`, `ringer(mode)`
 - [ ] Guard dangerous ops with confirmation
 - [ ] Tests
-- [ ] Tagged v0.6.0
+- [x] Tagged v0.6.0 ✅ SHIPPED
 
 ---
 
@@ -121,8 +134,9 @@
 - v0.3.0 — smart UI + sensors + thermals + comms
 - v0.4.0 — camera_photo + camera_video (Frontier #5)
 - v0.5.0 — logcat event stream → event_bus (Frontier #3)
+- v0.6.0 — settings mutation + presets (Frontier #13)
 
 ## Stats
-- Cycles completed: 2 / 100
-- Frontiers shipped: 2 / 13
-- Actions in tool: 72 (+camera_photo, +camera_video, +log_stream_start/stop/status)
+- Cycles completed: 3 / 100
+- Frontiers shipped: 3 / 13
+- Actions in tool: 81 (+9 settings: setting_get/put/delete/list/dump, set_ringer/brightness/bluetooth/airplane_mode)
