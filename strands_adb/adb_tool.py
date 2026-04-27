@@ -3647,6 +3647,448 @@ def _handle_power_subsystems(serial: Optional[str]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# 🔐  Security & Posture  (Frontier #13)
+# =============================================================================
+#
+# Security posture inspection — boot integrity, encryption, SELinux, lock
+# screen, biometric sensors, device admin apps, and VPN state. All read-only
+# introspection. Four actions:
+#
+#   security_posture     → device-wide security snapshot (pass/fail signals)
+#   security_lock        → lock screen config (PIN/pattern/password/none)
+#   security_biometrics  → fingerprint + face sensor enrollment
+#   security_vpn         → active VPN connections
+#
+# Why this matters to agents: "is this device safe to run automation on?"
+# Posture answers that in one call.
+
+
+# Biometric modality bits (android.hardware.biometrics.BiometricAuthenticator.Modality)
+#   TYPE_NONE         = 0
+#   TYPE_CREDENTIAL   = 1 << 0 = 1
+#   TYPE_FINGERPRINT  = 1 << 1 = 2
+#   TYPE_IRIS         = 1 << 2 = 4
+#   TYPE_FACE         = 1 << 3 = 8
+BIOMETRIC_MODALITY = {
+    1:  "credential",      # device PIN/pattern/password fallback
+    2:  "fingerprint",     # TYPE_FINGERPRINT (also UDFPS on Pixel)
+    4:  "iris",            # TYPE_IRIS
+    8:  "face",            # TYPE_FACE
+}
+# Strength classes (android.hardware.biometrics.BiometricManager.Authenticators)
+BIOMETRIC_STRENGTH = {
+    15:  "strong",       # BIOMETRIC_STRONG (Class 3)
+    255: "weak",         # BIOMETRIC_WEAK   (Class 2)
+    32768: "convenience", # DEVICE_CREDENTIAL
+}
+
+# Lock screen credential types (android.app.admin.DevicePolicyManager)
+LOCK_CRED_TYPES = {
+    -1: "managed",
+    0:  "none",
+    1:  "pattern",
+    2:  "pin",
+    3:  "password",
+    4:  "password_or_pin",
+    5:  "managed",
+}
+
+
+def _handle_security_posture(serial: Optional[str]) -> Dict[str, Any]:
+    """Device-wide security posture snapshot.
+
+    Checks: verified boot, SELinux enforcement, file-based encryption,
+    bootloader lock, OEM unlock, developer-options / ADB status,
+    Play Protect / package verifier, and current user count.
+    """
+    # Multi-prop fetch in one shell call (much faster than N calls)
+    keys = [
+        "ro.boot.verifiedbootstate",     # green / yellow / orange / red
+        "ro.boot.veritymode",            # enforcing / logging / disabled
+        "ro.boot.flash.locked",          # 1 / 0
+        "ro.oem_unlock_supported",       # 1 / 0
+        "ro.crypto.state",               # encrypted / unencrypted / unsupported
+        "ro.crypto.type",                # file / block / <empty>
+        "ro.build.selinux",              # 1 / 0 / <empty>
+        "ro.build.version.security_patch",  # YYYY-MM-DD
+        "ro.build.version.release",      # Android version
+        "ro.product.device",
+    ]
+    script = " ; ".join(f"echo '{k}='; getprop {k}" for k in keys)
+    r = _run(["shell", script], serial=serial, timeout=8)
+    if r["returncode"] != 0:
+        return _err(f"getprop failed: {r['stderr'][:120]}")
+
+    props: Dict[str, str] = {}
+    current_key: Optional[str] = None
+    for line in (r["stdout"] or "").splitlines():
+        if line.endswith("=") and line[:-1] in keys:
+            current_key = line[:-1]
+        elif current_key is not None:
+            props[current_key] = line.strip()
+            current_key = None
+
+    # Separately: SELinux enforcement state (runtime, not prop)
+    r2 = _run(["shell", "getenforce"], serial=serial, timeout=5)
+    selinux_enforcing = (r2["stdout"] or "").strip().lower() == "enforcing"
+
+    # Dev options + ADB + package verifier (via settings, fast)
+    r3 = _run(
+        ["shell",
+         "settings get global development_settings_enabled ;"
+         "echo --- ;"
+         "settings get global adb_enabled ;"
+         "echo --- ;"
+         "settings get global package_verifier_enable ;"
+         "echo --- ;"
+         "pm list users"],
+        serial=serial, timeout=8,
+    )
+    parts = (r3["stdout"] or "").split("---")
+    dev_enabled = parts[0].strip() == "1" if len(parts) > 0 else None
+    adb_enabled = parts[1].strip() == "1" if len(parts) > 1 else None
+    pkg_verifier = parts[2].strip() if len(parts) > 2 else ""
+    user_count = 0
+    if len(parts) > 3:
+        user_count = parts[3].count("UserInfo{")
+
+    # Interpret verified boot
+    vbs = props.get("ro.boot.verifiedbootstate", "").lower()
+    verified_boot_ok = vbs == "green"
+
+    # Bootloader locked? (flash.locked=1 means locked)
+    bootloader_locked = props.get("ro.boot.flash.locked", "0") == "1"
+
+    # Encryption: both state=encrypted AND type present
+    encrypted = (
+        props.get("ro.crypto.state", "").lower() == "encrypted"
+        and props.get("ro.crypto.type", "") != ""
+    )
+
+    # Summary "safe-to-use" posture
+    strong = (
+        verified_boot_ok
+        and bootloader_locked
+        and selinux_enforcing
+        and encrypted
+    )
+
+    # Build warnings list
+    # Separate critical warnings (posture failures) from informational ones
+    critical: List[str] = []
+    if not verified_boot_ok:
+        critical.append(f"verified_boot={vbs!r} (expected 'green')")
+    if not bootloader_locked:
+        critical.append("bootloader unlocked")
+    if not selinux_enforcing:
+        critical.append("SELinux not enforcing")
+    if not encrypted:
+        critical.append("storage not encrypted")
+    info: List[str] = []
+    if dev_enabled:
+        info.append("developer options enabled")
+    if adb_enabled:
+        info.append("ADB enabled (needed for this tool)")
+    if pkg_verifier == "0":
+        info.append("package verifier disabled")
+
+    warnings = critical + info  # combined for callers that want the full list
+
+    # 🟢 strong + no info warnings
+    # 🟡 strong but info warnings present (dev/ADB enabled but boot is fine)
+    # 🔴 any critical warning
+    if critical:
+        posture_emoji = "🔴"
+    elif info:
+        posture_emoji = "🟡"
+    else:
+        posture_emoji = "🟢"
+
+    lines = [
+        f"{posture_emoji} Security posture: "
+        f"{'STRONG' if strong else 'WEAKENED'} "
+        f"(Android {props.get('ro.build.version.release', '?')}, "
+        f"patch {props.get('ro.build.version.security_patch', '?')})",
+        f"   verified_boot: {vbs or 'unknown'}",
+        f"   bootloader:    {'locked' if bootloader_locked else 'UNLOCKED'}",
+        f"   selinux:       {'enforcing' if selinux_enforcing else 'PERMISSIVE'}",
+        f"   encryption:    "
+        f"{props.get('ro.crypto.state', '?')}"
+        f"{' (' + props['ro.crypto.type'] + '-based)' if props.get('ro.crypto.type') else ''}",
+        f"   developer:     {'ON' if dev_enabled else 'off'}  "
+        f"ADB: {'ON' if adb_enabled else 'off'}",
+    ]
+
+    return _ok(
+        "\n".join(lines),
+        strong_posture=strong,
+        android_version=props.get("ro.build.version.release"),
+        security_patch=props.get("ro.build.version.security_patch"),
+        verified_boot_state=vbs or None,
+        verified_boot_ok=verified_boot_ok,
+        verity_mode=props.get("ro.boot.veritymode"),
+        bootloader_locked=bootloader_locked,
+        oem_unlock_supported=props.get("ro.oem_unlock_supported") == "1",
+        selinux_enforcing=selinux_enforcing,
+        encrypted=encrypted,
+        encryption_type=props.get("ro.crypto.type") or None,
+        encryption_state=props.get("ro.crypto.state") or None,
+        developer_options=dev_enabled,
+        adb_enabled=adb_enabled,
+        package_verifier=pkg_verifier,
+        user_count=user_count,
+        warnings=warnings,
+        raw_props=props,
+    )
+
+
+def _handle_security_lock(serial: Optional[str]) -> Dict[str, Any]:
+    """Lock screen configuration: credential type, device-locked state."""
+    r = _run(
+        ["shell", "dumpsys", "lock_settings"],
+        serial=serial, timeout=8,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys lock_settings failed: {r['stderr'][:120]}")
+
+    import re as _re
+    out = r["stdout"] or ""
+
+    # Per-user blocks. We care about user 0 (primary).
+    # Format:
+    #   User State:
+    #     User 0
+    #       ...
+    #       Quality: 0
+    #       CredentialType: PIN
+    #       SeparateChallenge: true
+    users: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    user_re = _re.compile(r"^\s*User\s+(\d+)\s*$")
+    kv_re = _re.compile(r"^\s*([A-Za-z][A-Za-z0-9 ]+?):\s*(.+?)\s*$")
+
+    for raw in out.splitlines():
+        um = user_re.match(raw)
+        if um:
+            if current:
+                users.append(current)
+            current = {"user_id": int(um.group(1))}
+            continue
+        if current is None:
+            continue
+        km = kv_re.match(raw)
+        if km:
+            key = km.group(1).strip().lower().replace(" ", "_")
+            val = km.group(2).strip()
+            current[key] = val
+    if current:
+        users.append(current)
+
+    # Trust manager state (running state: locked/unlocked)
+    r2 = _run(
+        ["shell", "dumpsys", "trust"],
+        serial=serial, timeout=8,
+    )
+    trust_out = r2["stdout"] or ""
+
+    # Per-user trust state:
+    #   User "Name" (id=0, flags=0x..) (current): trustState=UNTRUSTED,
+    #   trustManaged=1, deviceLocked=1, isActiveUnlockRunning=0, strongAuthRequired=0x0
+    trust_re = _re.compile(
+        r'User\s+"[^"]*"\s+\(id=(\d+),[^)]*\)[^:]*:\s*'
+        r'trustState=(\w+),\s*trustManaged=(\d+),\s*deviceLocked=(\d+)'
+    )
+    trust_by_user: Dict[int, Dict[str, Any]] = {}
+    for tm in trust_re.finditer(trust_out):
+        uid = int(tm.group(1))
+        trust_by_user[uid] = {
+            "trust_state": tm.group(2),  # TRUSTED / UNTRUSTED
+            "trust_managed": tm.group(3) == "1",
+            "device_locked": tm.group(4) == "1",
+        }
+
+    # Merge trust info into users
+    for u in users:
+        ts = trust_by_user.get(u["user_id"], {})
+        u.update(ts)
+
+    # Primary user (0) for summary
+    primary = next((u for u in users if u["user_id"] == 0), users[0] if users else {})
+    cred_type = primary.get("credentialtype", "none")
+    secure = cred_type.lower() not in ("none", "")
+
+    lines = [
+        f"🔒 Lock screen ({'secured' if secure else 'NOT SECURED'}): "
+        f"{cred_type}",
+    ]
+    if primary:
+        if primary.get("device_locked") is not None:
+            lines.append(
+                f"   currently: {'LOCKED' if primary['device_locked'] else 'unlocked'}"
+            )
+        if "quality" in primary:
+            lines.append(f"   quality: {primary['quality']}")
+    if len(users) > 1:
+        lines.append(f"   {len(users)} user(s) / profile(s)")
+
+    return _ok(
+        "\n".join(lines),
+        secured=secure,
+        credential_type=cred_type,
+        users=users,
+        primary_user=primary,
+        user_count=len(users),
+    )
+
+
+def _handle_security_biometrics(serial: Optional[str]) -> Dict[str, Any]:
+    """Biometric sensor inventory: fingerprint + face + iris capabilities."""
+    r = _run(
+        ["shell", "dumpsys", "biometric"],
+        serial=serial, timeout=8,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys biometric failed: {r['stderr'][:120]}")
+
+    import re as _re
+    out = r["stdout"] or ""
+
+    # Sensor lines:
+    #   ID(1), oemStrength: 15, updatedStrength: 15, modality 8, state: 0, cookie: 0
+    #   ID(37748992), oemStrength: 15, updatedStrength: 15, modality 2, state: 0, cookie: 0
+    sensor_re = _re.compile(
+        r"ID\((\d+)\),\s*oemStrength:\s*(\d+),\s*updatedStrength:\s*(\d+),"
+        r"\s*modality\s*(\d+),\s*state:\s*(\d+)"
+    )
+    sensors: List[Dict[str, Any]] = []
+    for sm in sensor_re.finditer(out):
+        sid = int(sm.group(1))
+        oem_strength = int(sm.group(2))
+        cur_strength = int(sm.group(3))
+        modality_bits = int(sm.group(4))
+        state = int(sm.group(5))
+
+        # Decode modality bitmask — single bit typically, but build list for safety
+        modalities: List[str] = []
+        for bit, label in BIOMETRIC_MODALITY.items():
+            if modality_bits & bit:
+                modalities.append(label)
+        # If none matched and value is non-zero, record unknown
+        if not modalities and modality_bits:
+            modalities.append(f"unknown({modality_bits})")
+
+        sensors.append({
+            "id": sid,
+            "oem_strength": oem_strength,
+            "current_strength": cur_strength,
+            "strength_class": BIOMETRIC_STRENGTH.get(cur_strength, f"unknown({cur_strength})"),
+            "modality_bits": modality_bits,
+            "modalities": modalities,
+            "state": state,
+            "enabled": state == 0,  # state=0 means idle/available
+        })
+
+    # Legacy mode signal
+    legacy = "Legacy Settings: true" in out
+
+    # Split by modality for summary
+    fingerprint = [s for s in sensors if "fingerprint" in s["modalities"]]
+    face = [s for s in sensors if "face" in s["modalities"]]
+    iris = [s for s in sensors if "iris" in s["modalities"]]
+
+    has_any = bool(sensors)
+    parts = []
+    if fingerprint:
+        parts.append(f"fingerprint({len(fingerprint)})")
+    if face:
+        parts.append(f"face({len(face)})")
+    if iris:
+        parts.append(f"iris({len(iris)})")
+
+    summary = (
+        f"👆 Biometrics: {', '.join(parts) or 'none detected'}"
+        if has_any else "👆 Biometrics: none"
+    )
+
+    return _ok(
+        summary,
+        has_biometrics=has_any,
+        sensors=sensors,
+        fingerprint_count=len(fingerprint),
+        face_count=len(face),
+        iris_count=len(iris),
+        legacy_mode=legacy,
+        count=len(sensors),
+    )
+
+
+def _handle_security_vpn(serial: Optional[str]) -> Dict[str, Any]:
+    """Active VPN detection from connectivity manager.
+
+    A VPN tunnel shows up as a NetworkAgentInfo with 'Transports: VPN'
+    in its NetworkCapabilities. Regular Wi-Fi/cellular/ethernet all
+    carry the NOT_VPN capability.
+    """
+    r = _run(
+        ["shell", "dumpsys", "connectivity"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys connectivity failed: {r['stderr'][:120]}")
+
+    import re as _re
+    out = r["stdout"] or ""
+
+    # NetworkAgentInfo{network{N}  ... Transports: X,Y,Z Capabilities: ...}
+    # We want lines where Transports contains VPN (not NOT_VPN).
+    agent_re = _re.compile(
+        r"NetworkAgentInfo\{network\{(\d+)\}.*?"
+        r"Transports:\s*([A-Z&_,|]+).*?"
+        r"Capabilities:\s*([A-Z&_,|]+)",
+        _re.DOTALL,
+    )
+    vpns: List[Dict[str, Any]] = []
+    for am in agent_re.finditer(out):
+        transports = am.group(2)
+        # Check 'VPN' is in transports but not as part of NOT_VPN (capability)
+        # Transports are separated by & or ,
+        tokens = _re.split(r"[&,|]", transports)
+        if "VPN" not in tokens:
+            continue
+
+        caps = am.group(3)
+        interface_m = _re.search(
+            r"InterfaceName:\s*(\S+)",
+            out[am.start():am.end() + 1000],  # look ahead for LinkProperties
+        )
+        interface = interface_m.group(1).strip().rstrip('}') if interface_m else None
+
+        vpns.append({
+            "network_id": int(am.group(1)),
+            "transports": tokens,
+            "capabilities": _re.split(r"[&,|]", caps),
+            "interface": interface,
+        })
+
+    # Summary
+    if vpns:
+        summary = f"🔒 VPN: ACTIVE ({len(vpns)} tunnel{'s' if len(vpns) != 1 else ''})"
+        for v in vpns:
+            summary += f"\n   network#{v['network_id']} on {v['interface']}"
+    else:
+        summary = "🔒 VPN: not connected"
+
+    return _ok(
+        summary,
+        active=bool(vpns),
+        vpns=vpns,
+        count=len(vpns),
+    )
+
+
+
+# =============================================================================
 # 📡  Connectivity: Wi-Fi, Bluetooth, Airplane Mode  (Frontier #7)
 # =============================================================================
 #
@@ -5036,6 +5478,9 @@ ACTIONS = {
     # Power & battery (v0.15.0)
     "power_status", "power_thermal",
     "power_consumers", "power_subsystems",
+    # Security (v0.16.0)
+    "security_posture", "security_lock",
+    "security_biometrics", "security_vpn",
 }
 
 
@@ -5172,6 +5617,19 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Security: security_posture → device-wide snapshot (verified
+                      boot, bootloader lock, SELinux, encryption, dev
+                      options, ADB, Play Protect). Returns
+                      strong_posture bool + warnings list.
+                      security_lock → lock screen config: credential
+                      type ('none'|'pattern'|'pin'|'password'|
+                      'password_or_pin'|'managed'), device_locked,
+                      quality score, per-user profiles.
+                      security_biometrics → fingerprint/face/iris sensor
+                      inventory with modality bitmask decoded, strength
+                      class (strong/weak/convenience), state.
+                      security_vpn → active VPN tunnels via connectivity
+                      Transports=VPN. Returns interface name + caps.
             Power: power_status → battery level, voltage, temperature,
                    charging state, health, plug source.
                    power_thermal → overall thermal throttling status +
@@ -5599,6 +6057,16 @@ def adb(
             return _handle_power_consumers(power_top, serial)
         if action == "power_subsystems":
             return _handle_power_subsystems(serial)
+
+        # Security (v0.16.0)
+        if action == "security_posture":
+            return _handle_security_posture(serial)
+        if action == "security_lock":
+            return _handle_security_lock(serial)
+        if action == "security_biometrics":
+            return _handle_security_biometrics(serial)
+        if action == "security_vpn":
+            return _handle_security_vpn(serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
