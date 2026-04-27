@@ -2664,6 +2664,331 @@ def _handle_accessibility_status(serial: Optional[str]) -> Dict[str, Any]:
     return _ok("\n".join(lines), **{k: v for k, v in status.items()})
 
 
+
+# =============================================================================
+# 🔔  Notification Pipeline  (Frontier #11)
+# =============================================================================
+#
+# Agents gain read/write control over the Android notification manager: list
+# active notifications, post their own, snooze/unsnooze, manage DND (zen
+# mode), control per-package bypass, and query stats.
+#
+# APIs harnessed (no root, no NotificationListenerService needed):
+#
+#   cmd notification list                  — all active notification keys
+#   cmd notification get <key>             — full NotificationRecord dump
+#   cmd notification snooze --for <ms> <key>
+#   cmd notification unsnooze <key>
+#   cmd notification post [flags] <tag> <text>
+#   cmd notification set_dnd [on|off|priority|alarms|all|none]
+#   cmd notification allow_dnd <pkg>
+#   cmd notification disallow_dnd <pkg>
+#   settings get global zen_mode
+#   dumpsys notification                    — full state (parsed for stats)
+#
+# Key gotcha: notification keys like 0|com.shell|2020|tag|2000 contain `|`
+# pipes — shell splits on them. Every call must wrap the key in single
+# quotes inside the double-quoted shell arg.
+
+# Zen / DND modes recognized by `cmd notification set_dnd`
+DND_MODES = {
+    "off":      "off",       # zen_mode=0, allow everything
+    "on":       "on",        # alias for priority
+    "none":     "none",      # zen_mode=2, allow nothing
+    "priority": "priority",  # zen_mode=1, priority only
+    "alarms":   "alarms",    # zen_mode=3, alarms only
+    "all":      "all",       # alias for off
+}
+
+# Post styles supported by `cmd notification post -S <style>`
+POST_STYLES = {"bigtext", "bigpicture", "inbox", "messaging", "media"}
+
+
+def _shq(s: str) -> str:
+    """Shell-quote — wrap in single quotes, escape embedded quotes."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _parse_notif_key(raw: str) -> Dict[str, Any]:
+    """Split a notification key into its 5 parts.
+
+    Format: userId|package|id|tag|uid
+    Example: 0|com.google.android.gm|12345|null|10123
+    """
+    parts = raw.split("|")
+    if len(parts) < 5:
+        return {"raw": raw}
+    return {
+        "raw":     raw,
+        "user_id": parts[0],
+        "package": parts[1],
+        "id":      parts[2],
+        "tag":     parts[3] if parts[3] != "null" else None,
+        "uid":     parts[4],
+    }
+
+
+def _handle_notifications_list(serial: Optional[str]) -> Dict[str, Any]:
+    """List all currently posted notifications with parsed keys."""
+    r = _run(["shell", "cmd", "notification", "list"],
+             serial=serial, timeout=10)
+    if r["returncode"] != 0:
+        return _err(f"notification list failed: {r['stderr'][:120]}")
+
+    notifications = []
+    for line in (r["stdout"] or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        notifications.append(_parse_notif_key(line))
+
+    by_pkg: Dict[str, int] = {}
+    for n in notifications:
+        pkg = n.get("package", "?")
+        by_pkg[pkg] = by_pkg.get(pkg, 0) + 1
+
+    lines = [f"🔔 {len(notifications)} active notifications across "
+             f"{len(by_pkg)} apps:"]
+    for pkg, count in sorted(by_pkg.items(), key=lambda kv: -kv[1])[:15]:
+        lines.append(f"  {count:3d}  {pkg}")
+    if len(by_pkg) > 15:
+        lines.append(f"  ... and {len(by_pkg) - 15} more apps")
+
+    return _ok(
+        "\n".join(lines),
+        notifications=notifications,
+        count=len(notifications),
+        by_package=by_pkg,
+    )
+
+
+def _handle_notifications_get(
+    key: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Fetch full details of a specific notification by key."""
+    if not key:
+        return _err("notification_key required. "
+                    "Use action='notifications_list' first.")
+    if "|" not in key:
+        return _err(f"invalid notification key: {key!r} "
+                    f"(expected userId|pkg|id|tag|uid)")
+
+    r = _run(["shell", f"cmd notification get '{key}'"],
+             serial=serial, timeout=10)
+    if r["returncode"] != 0:
+        return _err(f"notification get failed: {r['stderr'][:120]}")
+
+    raw = r["stdout"] or ""
+    if not raw.strip() or "not found" in raw.lower():
+        return _err(f"notification not found: {key}")
+
+    parsed = _parse_notif_key(key)
+    details: Dict[str, Any] = {"key": key, **parsed}
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("android.title="):
+            details["title_info"] = line.split("=", 1)[1]
+        elif line.startswith("android.text="):
+            details["text_info"] = line.split("=", 1)[1]
+        elif line.startswith("android.subText="):
+            details["subtext_info"] = line.split("=", 1)[1]
+        elif line.startswith("pri="):
+            details["priority"] = line.split("=", 1)[1]
+        elif line.startswith("flags="):
+            details["flags"] = line.split("=", 1)[1]
+        elif "channel=" in line and "NotificationChannel" not in line:
+            after = line.split("channel=", 1)[1]
+            details.setdefault("channel", after.split()[0] if after else None)
+        elif line.startswith("importance="):
+            details["importance"] = line.split("=", 1)[1].split()[0]
+
+    summary = (
+        f"🔔 {parsed.get('package')} (id={parsed.get('id')})\n"
+        f"  channel:    {details.get('channel', '?')}\n"
+        f"  priority:   {details.get('priority', '?')}\n"
+        f"  importance: {details.get('importance', '?')}\n"
+        f"  flags:      {details.get('flags', '?')}"
+    )
+    return _ok(summary, raw_dump=raw[:3000], **details)
+
+
+def _handle_notifications_snooze(
+    key: str, duration_ms: int, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Snooze a notification for N milliseconds."""
+    if not key or "|" not in key:
+        return _err("valid notification key required")
+    if duration_ms < 100 or duration_ms > 7 * 24 * 3600 * 1000:
+        return _err("duration_ms must be 100..604800000 (1 week)")
+
+    r = _run(
+        ["shell", f"cmd notification snooze --for {duration_ms} '{key}'"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"snooze failed: {r['stderr'][:120]}")
+
+    return _ok(
+        f"🔔 snoozed {key} for {duration_ms}ms "
+        f"({duration_ms/1000:.1f}s)",
+        key=key,
+        duration_ms=duration_ms,
+        output=r["stdout"],
+    )
+
+
+def _handle_notifications_unsnooze(
+    key: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Unsnooze a previously snoozed notification."""
+    if not key or "|" not in key:
+        return _err("valid notification key required")
+    r = _run(
+        ["shell", f"cmd notification unsnooze '{key}'"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"unsnooze failed: {r['stderr'][:120]}")
+    return _ok(f"🔔 unsnoozed {key}", key=key)
+
+
+def _handle_notifications_post(
+    title: Optional[str],
+    text: str,
+    tag: str,
+    style: Optional[str],
+    serial: Optional[str],
+) -> Dict[str, Any]:
+    """Post a notification via shell. Appears under com.android.shell."""
+    if not text:
+        return _err("text required (the notification body)")
+    if not tag:
+        tag = f"strands_adb_{int(time.time())}"
+
+    cmd_parts = ["cmd", "notification", "post"]
+    if title:
+        cmd_parts += ["-t", _shq(title)]
+    if style:
+        if style not in POST_STYLES:
+            return _err(
+                f"unknown style '{style}'. Valid: {sorted(POST_STYLES)}"
+            )
+        cmd_parts += ["-S", style]
+    cmd_parts += [_shq(tag), _shq(text)]
+
+    r = _run(["shell", " ".join(cmd_parts)], serial=serial, timeout=10)
+    if r["returncode"] != 0:
+        return _err(f"post failed: {r['stderr'][:120]}")
+
+    return _ok(
+        f"🔔 posted notification (tag={tag})",
+        tag=tag,
+        title=title,
+        body_text=text,
+        style=style,
+        output=r["stdout"][:500],
+    )
+
+
+def _handle_notifications_set_dnd(
+    mode: str, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Set Do Not Disturb zen mode."""
+    if mode not in DND_MODES:
+        return _err(
+            f"unknown DND mode '{mode}'. Valid: {sorted(DND_MODES.keys())}"
+        )
+
+    r = _run(
+        ["shell", "cmd", "notification", "set_dnd", DND_MODES[mode]],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"set_dnd failed: {r['stderr'][:120]}")
+
+    zen_r = _run(
+        ["shell", "settings", "get", "global", "zen_mode"],
+        serial=serial, timeout=5,
+    )
+    zen = (zen_r["stdout"] or "").strip() if zen_r["returncode"] == 0 else "?"
+
+    return _ok(
+        f"🔔 DND set to '{mode}' (zen_mode={zen})",
+        mode=mode,
+        zen_mode=zen,
+    )
+
+
+def _handle_notifications_dnd_package(
+    package: str, allow: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Allow or disallow a package to bypass DND."""
+    if not package:
+        return _err("package required")
+
+    verb = "allow_dnd" if allow else "disallow_dnd"
+    r = _run(
+        ["shell", "cmd", "notification", verb, package],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"{verb} failed: {r['stderr'][:120]}")
+
+    action_verb = ("allowed to bypass DND" if allow
+                   else "blocked from bypassing DND")
+    return _ok(f"🔔 {package} {action_verb}",
+               package=package, allow=allow)
+
+
+def _handle_notifications_stats(serial: Optional[str]) -> Dict[str, Any]:
+    """Snapshot of notification system state (counts, DND, bans)."""
+    list_r = _run(
+        ["shell", "cmd", "notification", "list"],
+        serial=serial, timeout=10,
+    )
+    active_count = 0
+    if list_r["returncode"] == 0:
+        active_count = len([
+            ln for ln in (list_r["stdout"] or "").splitlines() if "|" in ln
+        ])
+
+    zen_r = _run(
+        ["shell", "settings", "get", "global", "zen_mode"],
+        serial=serial, timeout=5,
+    )
+    zen = (zen_r["stdout"] or "").strip() if zen_r["returncode"] == 0 else "?"
+    zen_name = {"0": "off", "1": "priority", "2": "none",
+                "3": "alarms"}.get(zen, f"unknown({zen})")
+
+    dump_r = _run(
+        ["shell", "dumpsys", "notification"],
+        serial=serial, timeout=15,
+    )
+    banned_count = recordcount = 0
+    if dump_r["returncode"] == 0:
+        out = dump_r["stdout"] or ""
+        banned_count = out.count('"banned":true')
+        recordcount = out.count("NotificationRecord(")
+
+    lines = [
+        "🔔 Notification system stats:",
+        f"  active notifications:     {active_count}",
+        f"  NotificationRecords:      {recordcount}",
+        f"  DND / zen_mode:           {zen_name} ({zen})",
+        f"  package bans (parsed):    {banned_count}",
+    ]
+    return _ok(
+        "\n".join(lines),
+        active_count=active_count,
+        record_count=recordcount,
+        zen_mode=zen,
+        zen_mode_name=zen_name,
+        banned_count=banned_count,
+    )
+
+
+
 ACTIONS = {
     # device
     "list_devices", "select_device", "device_info", "battery", "wake", "unlock",
@@ -2708,6 +3033,10 @@ ACTIONS = {
     "accessibility_system_action", "accessibility_captions",
     "accessibility_magnification", "accessibility_font_scale",
     "accessibility_status",
+    # Notification pipeline (v0.11.0)
+    "notifications_list", "notifications_get", "notifications_snooze",
+    "notifications_unsnooze", "notifications_post", "notifications_set_dnd",
+    "notifications_dnd_package", "notifications_stats",
 }
 
 
@@ -2785,6 +3114,16 @@ def adb(
     a11y_enable: bool = True,
     a11y_system_action: Optional[str] = None,
     a11y_font_scale: float = 1.0,
+    # Notification pipeline (v0.11.0)
+    notification_key: Optional[str] = None,
+    notification_duration_ms: int = 60_000,
+    notification_title: Optional[str] = None,
+    notification_text: Optional[str] = None,
+    notification_tag: str = "strands_adb",
+    notification_style: Optional[str] = None,
+    notification_dnd_mode: str = "off",
+    notification_package: Optional[str] = None,
+    notification_allow: bool = True,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -2815,6 +3154,17 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Notif:   notifications_list → all active + per-pkg counts.
+                     notifications_get (notification_key='0|pkg|id|tag|uid').
+                     notifications_snooze / notifications_unsnooze.
+                     notifications_post (notification_title=..., notification_text=...,
+                     notification_tag=..., notification_style=bigtext|bigpicture|
+                     inbox|messaging|media).
+                     notifications_set_dnd (notification_dnd_mode=off|on|none|
+                     priority|alarms|all).
+                     notifications_dnd_package (notification_package=com.foo,
+                     notification_allow=True).
+                     notifications_stats → counts, zen mode, bans.
             A11y:    accessibility_list → installed + enabled services.
                      accessibility_toggle_service (a11y_service='talkback',
                      a11y_enable=True) → toggle by alias or full component.
@@ -3094,6 +3444,33 @@ def adb(
             return _handle_accessibility_font_scale(a11y_font_scale, serial)
         if action == "accessibility_status":
             return _handle_accessibility_status(serial)
+
+        # Notification pipeline (v0.11.0)
+        if action == "notifications_list":
+            return _handle_notifications_list(serial)
+        if action == "notifications_get":
+            return _handle_notifications_get(notification_key, serial)
+        if action == "notifications_snooze":
+            return _handle_notifications_snooze(
+                notification_key, notification_duration_ms, serial,
+            )
+        if action == "notifications_unsnooze":
+            return _handle_notifications_unsnooze(notification_key, serial)
+        if action == "notifications_post":
+            return _handle_notifications_post(
+                notification_title, notification_text, notification_tag,
+                notification_style, serial,
+            )
+        if action == "notifications_set_dnd":
+            return _handle_notifications_set_dnd(notification_dnd_mode, serial)
+        if action == "notifications_dnd_package":
+            if not notification_package:
+                return _err("notifications_dnd_package requires notification_package")
+            return _handle_notifications_dnd_package(
+                notification_package, notification_allow, serial,
+            )
+        if action == "notifications_stats":
+            return _handle_notifications_stats(serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
