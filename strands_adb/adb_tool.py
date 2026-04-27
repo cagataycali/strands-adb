@@ -3147,6 +3147,506 @@ def _handle_sensor_get(
 
 
 # =============================================================================
+# 🔋  Power & Battery  (Frontier #8)
+# =============================================================================
+#
+# Deep insight into battery state, thermal health, and per-app power use:
+#
+#   dumpsys battery           → current state (level, voltage, temp, charging)
+#   dumpsys thermalservice    → thermal throttling + skin/CPU/GPU temps
+#   dumpsys batterystats      → per-UID + per-subsystem power drain (mAh)
+#
+# We parse the plain dump (human format) for `power_status`, `power_thermal`,
+# and `power_consumers` / `power_subsystems`. batterystats data accumulates
+# since last unplug (or since --reset), so returned values are deltas.
+
+# -- battery state ------------------------------------------------------
+
+# Android BatteryManager constants for status + health + plug
+BATTERY_STATUS = {
+    1: "unknown", 2: "charging", 3: "discharging",
+    4: "not_charging", 5: "full",
+}
+BATTERY_HEALTH = {
+    1: "unknown", 2: "good", 3: "overheat", 4: "dead",
+    5: "over_voltage", 6: "unspecified_failure", 7: "cold",
+}
+
+
+def _handle_power_status(serial: Optional[str]) -> Dict[str, Any]:
+    """Current battery state: level, voltage, temperature, charging."""
+    r = _run(["shell", "dumpsys", "battery"], serial=serial, timeout=10)
+    if r["returncode"] != 0:
+        return _err(f"dumpsys battery failed: {r['stderr'][:120]}")
+
+    state: Dict[str, Any] = {}
+    plug_sources: List[str] = []
+
+    for line in (r["stdout"] or "").splitlines():
+        stripped = line.strip()
+        # "AC powered: true" → plug sources
+        if stripped.startswith("AC powered:") and "true" in stripped:
+            plug_sources.append("ac")
+        elif stripped.startswith("USB powered:") and "true" in stripped:
+            plug_sources.append("usb")
+        elif stripped.startswith("Wireless powered:") and "true" in stripped:
+            plug_sources.append("wireless")
+        elif stripped.startswith("Dock powered:") and "true" in stripped:
+            plug_sources.append("dock")
+
+        # "key: value" format
+        if ":" in stripped and not stripped.startswith(("Time ", "The ")):
+            key, _, val = stripped.partition(":")
+            key = key.strip().lower().replace(" ", "_")
+            val = val.strip()
+            # Numeric fields
+            if key in ("level", "scale", "status", "health", "voltage",
+                      "temperature", "charge_counter", "max_charging_current",
+                      "max_charging_voltage", "charging_policy",
+                      "capacity_level", "battery_cycle_count"):
+                try:
+                    state[key] = int(val)
+                except ValueError:
+                    pass
+            elif key in ("technology",):
+                state[key] = val
+            elif val in ("true", "false"):
+                state[key] = (val == "true")
+
+    # Derived / humanized fields
+    level_pct = state.get("level")
+    temp_c = None
+    if "temperature" in state:
+        # Raw temp is in deciDegrees Celsius (329 → 32.9°C)
+        temp_c = state["temperature"] / 10.0
+    voltage_v = None
+    if "voltage" in state:
+        # Raw voltage is millivolts (4201 → 4.201 V)
+        voltage_v = state["voltage"] / 1000.0
+    status_text = BATTERY_STATUS.get(state.get("status", 1), "unknown")
+    health_text = BATTERY_HEALTH.get(state.get("health", 1), "unknown")
+    charging = status_text == "charging"
+
+    summary = (
+        f"🔋 {level_pct}% ({status_text}) "
+        f"{temp_c:.1f}°C "
+        f"{voltage_v:.3f}V"
+    ) if all(x is not None for x in (level_pct, temp_c, voltage_v)) else "🔋 (partial)"
+
+    if plug_sources:
+        summary += f" [plugged: {','.join(plug_sources)}]"
+
+    return _ok(
+        summary,
+        level_pct=level_pct,
+        battery_status=status_text,
+        battery_status_code=state.get("status"),
+        health=health_text,
+        health_code=state.get("health"),
+        charging=charging,
+        plugged=plug_sources,
+        temp_c=temp_c,
+        voltage_v=voltage_v,
+        charge_counter_uah=state.get("charge_counter"),
+        technology=state.get("technology"),
+        max_charging_current_ua=state.get("max_charging_current"),
+        max_charging_voltage_uv=state.get("max_charging_voltage"),
+        present=state.get("present"),
+        raw=state,
+    )
+
+
+# -- thermal ------------------------------------------------------------
+
+# Thermal status constants (Android PowerManager.THERMAL_STATUS_*)
+THERMAL_STATUS = {
+    0: "none", 1: "light", 2: "moderate", 3: "severe",
+    4: "critical", 5: "emergency", 6: "shutdown",
+}
+
+# Thermal sensor types (from android.os.Temperature.Type)
+THERMAL_TYPE = {
+    -1: "unknown", 0: "cpu", 1: "gpu", 2: "battery", 3: "skin",
+    4: "usb_port", 5: "powerable", 6: "ambient", 7: "bcl_voltage",
+    8: "bcl_current", 9: "npu", 10: "tpu",
+}
+
+
+def _handle_power_thermal(serial: Optional[str]) -> Dict[str, Any]:
+    """Thermal throttling state + per-zone temperatures."""
+    r = _run(
+        ["shell", "dumpsys", "thermalservice"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys thermalservice failed: {r['stderr'][:120]}")
+
+    import re as _re
+    out = r["stdout"] or ""
+
+    # Overall thermal status — "Thermal Status: N"
+    status_code: Optional[int] = None
+    m = _re.search(r"Thermal Status:\s*(\d+)", out)
+    if m:
+        status_code = int(m.group(1))
+
+    # Status override flag
+    override = "IsStatusOverride: true" in out
+
+    # Temperature lines:
+    # "Temperature{mValue=31.483381, mType=-1, mName=VIRTUAL-SKIN..., mStatus=0}"
+    temp_re = _re.compile(
+        r"Temperature\{mValue=([-\d.E+]+),\s*mType=(-?\d+),"
+        r"\s*mName=([^,]+?),\s*mStatus=(-?\d+)\}"
+    )
+
+    temps: List[Dict[str, Any]] = []
+    # "Cached temperatures:" appears once; parse all temps after it
+    cached_idx = out.find("Cached temperatures:")
+    search_from = cached_idx if cached_idx >= 0 else 0
+
+    for tm in temp_re.finditer(out, search_from):
+        try:
+            value = float(tm.group(1))
+        except ValueError:
+            continue
+        ttype = int(tm.group(2))
+        name = tm.group(3).strip()
+        tstatus = int(tm.group(4))
+        # Skip sentinel values (-3.4e38 = Float.MIN_VALUE, very negative)
+        if value < -1000 or value > 1000:
+            # Clearly invalid readings; still include but flag
+            valid = False
+        else:
+            valid = True
+        temps.append({
+            "name": name,
+            "value_c": value,
+            "type_id": ttype,
+            "type": THERMAL_TYPE.get(ttype, "unknown"),
+            "status_code": tstatus,
+            "status": THERMAL_STATUS.get(tstatus, "unknown"),
+            "valid": valid,
+        })
+
+    # Group by type for summary
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for t in temps:
+        by_type.setdefault(t["type"], []).append(t)
+
+    # Highlight key temps
+    def _pick(name_substring: str) -> Optional[Dict[str, Any]]:
+        for t in temps:
+            if t["valid"] and name_substring.lower() in t["name"].lower():
+                return t
+        return None
+
+    highlights = {
+        "battery": _pick("battery"),
+        "skin": _pick("skin-legacy") or _pick("skin"),
+        "cpu_big": _pick("BIG"),
+        "cpu_mid": _pick("MID"),
+        "cpu_little": _pick("LITTLE"),
+        "tpu": _pick("TPU"),
+        "gpu": _pick("GPU"),
+    }
+
+    status_label = THERMAL_STATUS.get(status_code, "unknown")
+    summary = (
+        f"🌡️  thermal={status_label} "
+        f"(battery={highlights['battery']['value_c']:.1f}°C, "
+        f"skin={highlights['skin']['value_c']:.1f}°C)"
+        if highlights["battery"] and highlights["skin"]
+        else f"🌡️  thermal={status_label}"
+    )
+
+    return _ok(
+        summary,
+        thermal_status=status_label,
+        thermal_status_code=status_code,
+        override=override,
+        temperatures=temps,
+        highlights=highlights,
+        by_type=by_type,
+        count=len(temps),
+    )
+
+
+# -- power consumers & subsystems --------------------------------------
+
+# Subsystem codes in `pwi,` lines (batterystats --checkin)
+PWI_SUBSYSTEMS = {
+    "scrn": "screen",
+    "cpu":  "cpu",
+    "blue": "bluetooth",
+    "camera": "camera",
+    "audio": "audio",
+    "video": "video",
+    "flashlight": "flashlight",
+    "cell": "mobile_radio",
+    "sensors": "sensors",
+    "gnss": "gnss",
+    "wifi":  "wifi",
+    "memory": "memory",
+    "phone": "phone",
+    "ambi":  "ambient_display",
+    "idle":  "idle",
+}
+
+
+def _parse_batterystats_uids(out: str) -> Dict[int, List[str]]:
+    """Extract UID → [package_names] from batterystats --checkin output.
+
+    Format: '9,0,i,uid,10155,com.app.name'
+    """
+    mapping: Dict[int, List[str]] = {}
+    for line in out.splitlines():
+        if not line.startswith(("9,0,i,uid,", "8,0,i,uid,", "7,0,i,uid,")):
+            continue
+        parts = line.split(",", 5)
+        if len(parts) < 6:
+            continue
+        try:
+            uid = int(parts[4])
+        except ValueError:
+            continue
+        pkg = parts[5].strip()
+        mapping.setdefault(uid, []).append(pkg)
+    return mapping
+
+
+def _parse_uid_consumers(out: str) -> List[Dict[str, Any]]:
+    """Parse '  UID nnnn: mAh ...' lines from human dumpsys batterystats.
+
+    Format examples:
+      "  UID 1073: 857 fg: 2.96 (2h ...) bg: 854 cached: 0 (76ms)"
+      "  UID u0a155: 260 fg: 50.3 (...) bg: 175 (...) fgs: 0.870 (...) cached: 0.00455 (...)"
+
+    `u0a155` = user 0, app 155 = UID 10155
+    """
+    import re as _re
+    consumers: List[Dict[str, Any]] = []
+
+    # "UID u0aN" or "UID NNNN"
+    uid_re = _re.compile(
+        r"^\s*UID\s+(u(\d+)a(\d+)|(\d+)):\s*([\d.]+)"
+    )
+    # fg/bg/fgs/cached times + power: "fg: 50.3 (19m 39s 400ms)"
+    part_re = _re.compile(
+        r"\b(fg|bg|fgs|cached):\s*([\d.eE+-]+)(?:\s*\(([^)]+)\))?"
+    )
+
+    lines = out.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = uid_re.match(line)
+        if not m:
+            i += 1
+            continue
+
+        # Resolve UID
+        if m.group(2) is not None:
+            # u0aN → 10000 + N for user 0
+            user_id = int(m.group(2))
+            app_id = int(m.group(3))
+            uid = user_id * 100000 + 10000 + app_id
+        else:
+            uid = int(m.group(4))
+
+        try:
+            total_mah = float(m.group(5))
+        except ValueError:
+            i += 1
+            continue
+
+        # Parse fg/bg/fgs/cached from the same line
+        parts: Dict[str, float] = {}
+        for pm in part_re.finditer(line):
+            key = pm.group(1)
+            try:
+                parts[f"{key}_mah"] = float(pm.group(2))
+            except ValueError:
+                pass
+
+        # Also parse the continuation line for per-subsystem drain, e.g.:
+        #   "      cpu=21.5 camera=202 ... wakelock=0.0134 (3s 29ms)"
+        subsystems: Dict[str, float] = {}
+        if i + 1 < len(lines) and lines[i + 1].startswith("      "):
+            for ss in _re.finditer(
+                r"(\w+)=([\d.eE+-]+)", lines[i + 1]
+            ):
+                name = ss.group(1)
+                # Skip sub-measurements (cpu:fg etc.) — they use : not =
+                try:
+                    subsystems[name] = float(ss.group(2))
+                except ValueError:
+                    pass
+            i += 2
+        else:
+            i += 1
+
+        consumers.append({
+            "uid": uid,
+            "total_mah": total_mah,
+            **parts,
+            "subsystems": subsystems,
+        })
+
+    return consumers
+
+
+def _handle_power_consumers(
+    top: int, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Top power consumers by UID, with package names resolved."""
+    # Parallel fetch: human dump for UIDs, checkin for UID→pkg mapping
+    r = _run(
+        ["shell", "dumpsys", "batterystats"],
+        serial=serial, timeout=30,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys batterystats failed: {r['stderr'][:120]}")
+
+    consumers = _parse_uid_consumers(r["stdout"] or "")
+
+    # Resolve package names via checkin
+    r2 = _run(
+        ["shell", "dumpsys", "batterystats", "--checkin"],
+        serial=serial, timeout=30,
+    )
+    uid_to_pkgs: Dict[int, List[str]] = {}
+    if r2["returncode"] == 0:
+        uid_to_pkgs = _parse_batterystats_uids(r2["stdout"] or "")
+
+    # Attach package names
+    for c in consumers:
+        c["packages"] = uid_to_pkgs.get(c["uid"], [])
+
+    # Sort by total_mah desc, take top N
+    consumers.sort(key=lambda x: x["total_mah"], reverse=True)
+    top_n = consumers[:top]
+
+    # Summary
+    lines = [f"🔌 Top {min(top, len(consumers))} power consumers (mAh):"]
+    for c in top_n[:10]:
+        pkgs = c.get("packages", [])
+        pkg_str = pkgs[0] if pkgs else f"uid={c['uid']}"
+        if len(pkgs) > 1:
+            pkg_str += f" (+{len(pkgs) - 1} more)"
+        lines.append(f"   {c['total_mah']:8.2f} mAh  {pkg_str}")
+
+    return _ok(
+        "\n".join(lines),
+        consumers=top_n,
+        total_count=len(consumers),
+    )
+
+
+def _handle_power_subsystems(serial: Optional[str]) -> Dict[str, Any]:
+    """Global per-subsystem power breakdown (screen/cpu/wifi/cell/gnss/etc)."""
+    r = _run(
+        ["shell", "dumpsys", "batterystats"],
+        serial=serial, timeout=30,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys batterystats failed: {r['stderr'][:120]}")
+
+    out = r["stdout"] or ""
+
+    import re as _re
+    # Find "Estimated power use (mAh):"
+    idx = out.find("Estimated power use (mAh):")
+    if idx < 0:
+        return _err("no 'Estimated power use' section found")
+
+    # Parse lines until we hit the first per-condition section
+    # (which starts with "    (on battery, screen on)" or a UID)
+    subsystems: Dict[str, Dict[str, Any]] = {}
+    capacity_mah: Optional[float] = None
+    computed_drain_mah: Optional[float] = None
+    actual_drain_mah: Optional[float] = None
+
+    section = out[idx:]
+    for line in section.splitlines()[:40]:
+        stripped = line.strip()
+        # "Capacity: 4830, Computed drain: 4042, actual drain: 4042"
+        cap_m = _re.match(
+            r"Capacity:\s*([\d.]+),\s*Computed drain:\s*([\d.]+),"
+            r"\s*actual drain:\s*([\d.]+)",
+            stripped
+        )
+        if cap_m:
+            capacity_mah = float(cap_m.group(1))
+            computed_drain_mah = float(cap_m.group(2))
+            actual_drain_mah = float(cap_m.group(3))
+            continue
+
+        # Stop at per-condition or "(on battery, screen on)" section
+        if stripped.startswith("(on battery"):
+            break
+        # Or when we hit UID enumeration
+        if stripped.startswith("UID "):
+            break
+
+        # "screen: 109 apps: 109"
+        # "cpu: 337 apps: 338 duration: 6h 3m 22s 567ms"
+        sub_m = _re.match(
+            r"^([a-z_]+):\s*([\d.eE+-]+)"
+            r"(?:\s+apps:\s*([\d.eE+-]+))?"
+            r"(?:\s+duration:\s*(.+?))?$",
+            stripped
+        )
+        if sub_m:
+            name = sub_m.group(1)
+            try:
+                total = float(sub_m.group(2))
+            except ValueError:
+                continue
+            apps = None
+            if sub_m.group(3):
+                try:
+                    apps = float(sub_m.group(3))
+                except ValueError:
+                    pass
+            subsystems[name] = {
+                "name": name,
+                "total_mah": total,
+                "apps_mah": apps,
+                "duration": sub_m.group(4) if sub_m.group(4) else None,
+            }
+
+    # Sort by total_mah desc for the summary
+    sorted_subs = sorted(
+        subsystems.values(),
+        key=lambda x: x["total_mah"],
+        reverse=True,
+    )
+
+    lines = [
+        f"⚡ Global power breakdown:",
+        f"   Capacity: {capacity_mah} mAh  |  "
+        f"Computed: {computed_drain_mah} mAh  |  "
+        f"Actual: {actual_drain_mah} mAh",
+    ]
+    for sub in sorted_subs[:10]:
+        lines.append(
+            f"   {sub['total_mah']:8.2f} mAh  {sub['name']}"
+            + (f" (apps: {sub['apps_mah']})" if sub['apps_mah'] is not None else "")
+        )
+
+    return _ok(
+        "\n".join(lines),
+        subsystems=subsystems,
+        sorted=sorted_subs,
+        capacity_mah=capacity_mah,
+        computed_drain_mah=computed_drain_mah,
+        actual_drain_mah=actual_drain_mah,
+    )
+
+
+
+# =============================================================================
 # 📡  Connectivity: Wi-Fi, Bluetooth, Airplane Mode  (Frontier #7)
 # =============================================================================
 #
@@ -4533,6 +5033,9 @@ ACTIONS = {
     "airplane_mode_get", "airplane_mode_set",
     # Sensor feeds (v0.14.0)
     "sensors_list", "sensors_recent", "sensor_get",
+    # Power & battery (v0.15.0)
+    "power_status", "power_thermal",
+    "power_consumers", "power_subsystems",
 }
 
 
@@ -4637,6 +5140,8 @@ def adb(
     airplane_enabled: bool = False,
     # Sensor feeds (v0.14.0)
     sensor_query: Any = None,
+    # Power & battery (v0.15.0)
+    power_top: int = 20,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -4667,6 +5172,18 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Power: power_status → battery level, voltage, temperature,
+                   charging state, health, plug source.
+                   power_thermal → overall thermal throttling status +
+                   per-zone temperatures (battery/skin/CPU big/mid/little/
+                   TPU/GPU etc.) from `dumpsys thermalservice`.
+                   power_consumers (power_top=N) → top N UIDs by mAh
+                   drained since last unplug, with package names
+                   resolved and per-subsystem breakdown (cpu, screen,
+                   camera, mobile_radio, wifi, wakelock, …).
+                   power_subsystems → global power breakdown by
+                   subsystem (screen/cpu/cell/wifi/gnss/camera/ambient_
+                   display/etc.) from batterystats 'Estimated power use'.
             Sensors: sensors_list → all 40+ sensors with rates, vendor,
                      wake-up, reporting mode. Grouped motion/env/composite.
                      sensors_recent → latest events across all active
@@ -5072,6 +5589,16 @@ def adb(
             if not sensor_query:
                 return _err("sensor_get requires sensor_query (e.g. 'accelerometer', 'gyro', 5)")
             return _handle_sensor_get(sensor_query, serial)
+
+        # Power & battery (v0.15.0)
+        if action == "power_status":
+            return _handle_power_status(serial)
+        if action == "power_thermal":
+            return _handle_power_thermal(serial)
+        if action == "power_consumers":
+            return _handle_power_consumers(power_top, serial)
+        if action == "power_subsystems":
+            return _handle_power_subsystems(serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
