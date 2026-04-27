@@ -155,11 +155,26 @@
 - [x] NEXT: Cycle 9 — Frontier #5 media session & AVRCP (play/pause/skip,
       volume control, current-track metadata via dumpsys media_session)
 
-### Cycle 9 — Frontier #5 Media Session (STARTING)
-- [ ] `media_sessions_list` — parse dumpsys media_session
-- [ ] `media_control` — play/pause/skip/stop via key events or AVRCP
-- [ ] `media_metadata` — current track/artist/album
-- [ ] `media_volume` — set stream volume
+### Cycle 9 — Frontier #5 Media Session (DONE)
+- [x] media_dispatch: 11 keys + 6 aliases (skip/back/toggle/ff/prev/playpause)
+- [x] media_volume_get: 9 streams (music/ring/alarm/voice/notif/bt/a11y/...)
+- [x] media_volume_set: bounds-checked w/ verify read-back
+- [x] media_volume_adjust: up/down/same + 5 English aliases
+- [x] media_sessions_list: dumpsys parser with prose-leak guard
+- [x] media_now_playing: currently-playing session + metadata
+- [x] cmd vs bare command — fixed (must use `cmd media_session ...`)
+- [x] Dumpsys prose leak (Global priority session) fixed with tag-match invariant
+- [x] Device-policy-vs-API discrepancy documented in tests
+- [x] 18 new tests (policy-aware volume round trip)
+- [x] Tagged v0.12.0
+- [x] NEXT: Cycle 10 — Frontier #7 Wi-Fi/BT/tethering control (cmd wifi,
+      cmd bluetooth_manager, settings for airplane mode, hotspot toggle)
+
+### Cycle 10 — Frontier #7 Connectivity (STARTING)
+- [ ] `wifi_scan` / `wifi_connect` / `wifi_list_saved`
+- [ ] `bt_scan` / `bt_pair` / `bt_list_paired`
+- [ ] `airplane_mode_toggle`
+- [ ] `hotspot_toggle`
 - [ ] Tests
 
 
@@ -211,8 +226,9 @@
 - v0.9.0 — gesture streaming via motionevent (Frontier #2)
 - v0.10.0 — accessibility / ATC control (Frontier #8)
 - v0.11.0 — notification pipeline (Frontier #11)
+- v0.12.0 — media session & AVRCP (Frontier #5)
 
 ## Stats
-- Cycles completed: 8 / 100
-- Frontiers shipped: 8 / 13
-- Actions in tool: 105 (+8 notifications: list/get/snooze/unsnooze/post/set_dnd/dnd_package/stats)
+- Cycles completed: 9 / 100
+- Frontiers shipped: 9 / 13
+- Actions in tool: 111 (+6 media: dispatch/volume_get/volume_set/volume_adjust/sessions_list/now_playing)
