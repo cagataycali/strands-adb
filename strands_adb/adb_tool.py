@@ -229,8 +229,18 @@ def _handle_key(key: str, serial: Optional[str]) -> Dict[str, Any]:
 
 
 def _handle_screenshot(
-    output_path: Optional[str], serial: Optional[str], return_base64: bool
+    output_path: Optional[str],
+    serial: Optional[str],
+    return_base64: bool,
+    include_image: bool,
 ) -> Dict[str, Any]:
+    """Capture PNG from device.
+
+    When ``include_image`` is True, returns a Converse API image block so
+    the agent can actually *see* the screen (same pattern as
+    strands_tools.image_reader). This is the whole point of the tool —
+    close the perception loop.
+    """
     out = Path(output_path) if output_path else Path(
         f"/tmp/adb_screenshot_{int(time.time())}.png"
     )
@@ -248,22 +258,41 @@ def _handle_screenshot(
     except subprocess.TimeoutExpired:
         return _err("screenshot timed out")
 
-    data = proc.stdout or b""
-    if proc.returncode != 0 or not data.startswith(b"\x89PNG"):
-        # Fallback: shell + pull
+    png_bytes = proc.stdout or b""
+    if proc.returncode != 0 or not png_bytes.startswith(b"\x89PNG"):
+        # Fallback: shell + pull (handles devices where exec-out is flaky)
         _run(["shell", "screencap", "-p", "/sdcard/_shot.png"], serial=serial, timeout=20)
         r = _run(["pull", "/sdcard/_shot.png", str(out)], serial=serial, timeout=20)
         _run(["shell", "rm", "/sdcard/_shot.png"], serial=serial)
         if r["returncode"] != 0 or not out.exists():
-            return _err(f"screenshot failed: {proc.stderr.decode(errors='ignore')[:500]}")
+            return _err(
+                f"screenshot failed: {proc.stderr.decode(errors='ignore')[:500]}"
+            )
+        png_bytes = out.read_bytes()
     else:
-        out.write_bytes(data)
+        out.write_bytes(png_bytes)
 
-    size = out.stat().st_size
-    body: Dict[str, Any] = {"path": str(out), "size_bytes": size}
+    size = len(png_bytes)
+    summary = f"screenshot saved: {out} ({size} bytes)"
+
+    # Build content blocks: text summary + (optional) image for Converse API
+    content: List[Dict[str, Any]] = [{"text": summary}]
+    if include_image:
+        # Converse API image block — identical format to strands_tools.image_reader.
+        # The agent will literally see the pixels, not just the path.
+        content.append(
+            {"image": {"format": "png", "source": {"bytes": png_bytes}}}
+        )
+
+    payload: Dict[str, Any] = {
+        "status": "success",
+        "content": content,
+        "path": str(out),
+        "size_bytes": size,
+    }
     if return_base64:
-        body["base64"] = base64.b64encode(out.read_bytes()).decode()
-    return _ok(f"screenshot saved: {out} ({size} bytes)", **body)
+        payload["base64"] = base64.b64encode(png_bytes).decode()
+    return payload
 
 
 def _handle_ui_dump(serial: Optional[str]) -> Dict[str, Any]:
@@ -460,6 +489,7 @@ def adb(
     key: Optional[str] = None,
     output_path: Optional[str] = None,
     return_base64: bool = False,
+    include_image: bool = True,
     package: Optional[str] = None,
     apk_path: Optional[str] = None,
     local: Optional[str] = None,
@@ -505,6 +535,9 @@ def adb(
         key: Key name (back, home, enter, volume_up, etc.) or raw keycode.
         output_path: Screenshot output path (default /tmp/adb_screenshot_*.png).
         return_base64: If True, include base64 of screenshot in response.
+        include_image: If True (default), include a Converse API image block
+            so the agent can visually see the screen (same format as
+            strands_tools.image_reader). Set False for pure text/path response.
         package: Android package name (e.g. com.whatsapp).
         apk_path: Local APK path for install.
         local, remote: File paths for push/pull.
@@ -568,7 +601,9 @@ def adb(
         if action == "recent":
             return _handle_key("recent", serial)
         if action == "screenshot":
-            return _handle_screenshot(output_path, serial, return_base64)
+            return _handle_screenshot(
+                output_path, serial, return_base64, include_image
+            )
         if action == "ui_dump":
             return _handle_ui_dump(serial)
         if action == "list_packages":

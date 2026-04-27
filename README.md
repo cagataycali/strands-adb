@@ -34,6 +34,21 @@ export DEVDUCK_TOOLS="strands_adb:adb;strands_tools:shell"
 devduck "open whatsapp and read the last message from mom"
 ```
 
+
+## 👁️ Agent can SEE the screen
+
+`screenshot` returns a proper [Converse API image block](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)
+— the same format as `strands_tools.image_reader`. The agent doesn't just get
+a file path, it actually receives the pixels and can reason over them:
+
+```python
+agent("take a screenshot and tell me what app is open")
+# Agent calls adb(action="screenshot") → receives PNG bytes in its context
+# → vision model reads it → "You're on the WhatsApp chat with Mom..."
+```
+
+Disable with `include_image=False` if you just want the file path.
+
 ## Capabilities
 
 - **Device**: list, select, info, battery, wake, unlock

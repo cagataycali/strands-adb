@@ -44,3 +44,28 @@ def test_battery():
     r = adb(action="battery")
     assert r["status"] == "success"
     assert "level" in r["content"][0]["text"].lower()
+
+
+@needs_device
+def test_screenshot_returns_image_block():
+    """Screenshot must return a Converse API image block so the agent can SEE."""
+    r = adb(action="screenshot", output_path="/tmp/_test_shot.png")
+    assert r["status"] == "success"
+    # Block 0: text summary, Block 1: image block
+    assert len(r["content"]) == 2
+    img_block = r["content"][1]
+    assert "image" in img_block
+    assert img_block["image"]["format"] == "png"
+    assert img_block["image"]["source"]["bytes"].startswith(b"\x89PNG")
+
+
+@needs_device
+def test_screenshot_no_image_when_disabled():
+    r = adb(
+        action="screenshot",
+        output_path="/tmp/_test_shot2.png",
+        include_image=False,
+    )
+    assert r["status"] == "success"
+    assert len(r["content"]) == 1
+    assert "text" in r["content"][0]
