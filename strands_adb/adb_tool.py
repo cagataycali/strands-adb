@@ -2666,6 +2666,486 @@ def _handle_accessibility_status(serial: Optional[str]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# 🎵  Media Session & AVRCP  (Frontier #5)
+# =============================================================================
+#
+# Agents control media playback and volume across any app: Spotify, YouTube,
+# Music, Podcasts, etc. Dispatch any media key, query/adjust/set stream
+# volumes, and read session state (active app, playback state, metadata).
+#
+# APIs harnessed (no root):
+#
+#   cmd media_session dispatch <KEY>        — global media key
+#       KEY: play, pause, play-pause, mute, headsethook, stop,
+#            next, previous, rewind, record, fast-forward
+#   cmd media_session volume --stream N --get|--set N|--adj raise|same|lower
+#       STREAM: 0=voice_call, 1=system, 2=ring, 3=music, 4=alarm,
+#               5=notification, 6=bluetooth_sco, 10=accessibility
+#   cmd media_session list-sessions          — session tags
+#   dumpsys media_session                    — full state: active/inactive
+#                                              sessions, packages, metadata
+#   input keyevent 24|25|164                 — volume up/down/mute fallback
+#
+# The volume command outputs multiple "[V]" debug lines. Parse the final
+# "volume is N in range [min..max]" line for the numeric value.
+
+MEDIA_KEYS = {
+    "play", "pause", "play-pause", "play_pause",
+    "mute", "headsethook", "stop",
+    "next", "previous", "rewind", "record",
+    "fast-forward", "fast_forward", "ff",
+}
+
+# Mapping of agent-friendly aliases to the exact CLI token
+MEDIA_KEY_ALIASES = {
+    "playpause":   "play-pause",
+    "play_pause":  "play-pause",
+    "toggle":      "play-pause",
+    "fast_forward": "fast-forward",
+    "ff":          "fast-forward",
+    "skip":        "next",
+    "back":        "previous",
+    "prev":        "previous",
+}
+
+# Stream name → AudioManager.STREAM_* constant
+AUDIO_STREAMS = {
+    "voice_call":    0,
+    "voice":         0,
+    "call":          0,
+    "system":        1,
+    "sys":           1,
+    "ring":          2,
+    "ringtone":      2,
+    "music":         3,
+    "media":         3,
+    "alarm":         4,
+    "notification":  5,
+    "notif":         5,
+    "bluetooth_sco": 6,
+    "bt":            6,
+    "dtmf":          8,
+    "accessibility": 10,
+    "a11y":          10,
+}
+
+# Reverse lookup so `volume_get` can name the stream
+AUDIO_STREAM_NAMES = {
+    0: "voice_call",
+    1: "system",
+    2: "ring",
+    3: "music",
+    4: "alarm",
+    5: "notification",
+    6: "bluetooth_sco",
+    8: "dtmf",
+    10: "accessibility",
+}
+
+
+def _resolve_media_key(key: str) -> Optional[str]:
+    """Resolve a media key name (with aliases) to the CLI token."""
+    if not key:
+        return None
+    low = key.lower().strip()
+    # Alias first
+    low = MEDIA_KEY_ALIASES.get(low, low)
+    if low in MEDIA_KEYS:
+        return low
+    return None
+
+
+def _resolve_stream(stream: Any) -> Optional[int]:
+    """Resolve a stream name/number to AudioManager constant."""
+    if isinstance(stream, int):
+        return stream if stream in AUDIO_STREAM_NAMES else None
+    if isinstance(stream, str):
+        low = stream.lower().strip()
+        if low in AUDIO_STREAMS:
+            return AUDIO_STREAMS[low]
+        if low.isdigit() and int(low) in AUDIO_STREAM_NAMES:
+            return int(low)
+    return None
+
+
+def _parse_volume_output(out: str) -> Dict[str, Optional[int]]:
+    """Parse `cmd media_session volume --get` output.
+
+    Last line is of form: `[V] volume is N in range [MIN..MAX]`
+    """
+    volume = vol_min = vol_max = None
+    for line in (out or "").splitlines():
+        line = line.strip()
+        # "[V] volume is 5 in range [0..25]"
+        if "volume is" in line and "range" in line:
+            try:
+                after_is = line.split("volume is", 1)[1].strip()
+                parts = after_is.split()
+                volume = int(parts[0])
+                # Extract the [min..max] bracket
+                if "[" in after_is and "]" in after_is:
+                    inner = after_is.split("[", 1)[1].split("]", 1)[0]
+                    if ".." in inner:
+                        mn, mx = inner.split("..", 1)
+                        vol_min = int(mn)
+                        vol_max = int(mx)
+            except (ValueError, IndexError):
+                pass
+    return {"volume": volume, "min": vol_min, "max": vol_max}
+
+
+def _handle_media_dispatch(key: str, serial: Optional[str]) -> Dict[str, Any]:
+    """Dispatch a media key globally."""
+    resolved = _resolve_media_key(key)
+    if resolved is None:
+        return _err(
+            f"unknown media key '{key}'. Valid: {sorted(MEDIA_KEYS)}. "
+            f"Aliases: {sorted(MEDIA_KEY_ALIASES.keys())}."
+        )
+
+    r = _run(
+        ["shell", "cmd", "media_session", "dispatch", resolved],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dispatch failed: {r['stderr'][:120]}")
+
+    return _ok(
+        f"🎵 dispatched '{resolved}'",
+        key=resolved,
+        original_key=key,
+    )
+
+
+def _handle_media_volume_get(
+    stream: Any, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Get current volume for an audio stream."""
+    stream_id = _resolve_stream(stream)
+    if stream_id is None:
+        return _err(
+            f"unknown stream '{stream}'. Valid: {sorted(AUDIO_STREAMS.keys())}"
+        )
+
+    r = _run(
+        ["shell", "cmd", "media_session", "volume",
+         "--stream", str(stream_id), "--get"],
+        serial=serial, timeout=5,
+    )
+    if r["returncode"] != 0:
+        return _err(f"volume get failed: {r['stderr'][:120]}")
+
+    parsed = _parse_volume_output(r["stdout"] or "")
+    stream_name = AUDIO_STREAM_NAMES.get(stream_id, str(stream_id))
+
+    if parsed["volume"] is None:
+        return _err(f"could not parse volume output: {r['stdout'][:200]!r}")
+
+    return _ok(
+        f"🎵 {stream_name} volume: {parsed['volume']}/{parsed['max']}",
+        stream=stream_name,
+        stream_id=stream_id,
+        volume=parsed["volume"],
+        volume_min=parsed["min"],
+        volume_max=parsed["max"],
+    )
+
+
+def _handle_media_volume_set(
+    stream: Any, index: int, show_ui: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Set volume to a specific index."""
+    stream_id = _resolve_stream(stream)
+    if stream_id is None:
+        return _err(
+            f"unknown stream '{stream}'. Valid: {sorted(AUDIO_STREAMS.keys())}"
+        )
+    if index < 0 or index > 100:
+        return _err("volume index must be 0..100")
+
+    args = ["shell", "cmd", "media_session", "volume",
+            "--stream", str(stream_id), "--set", str(index)]
+    if show_ui:
+        args.append("--show")
+
+    r = _run(args, serial=serial, timeout=5)
+    if r["returncode"] != 0:
+        return _err(f"volume set failed: {r['stderr'][:120]}")
+
+    # Read back to confirm
+    verify = _run(
+        ["shell", "cmd", "media_session", "volume",
+         "--stream", str(stream_id), "--get"],
+        serial=serial, timeout=5,
+    )
+    parsed = _parse_volume_output(verify["stdout"] or "")
+
+    stream_name = AUDIO_STREAM_NAMES.get(stream_id, str(stream_id))
+    return _ok(
+        f"🎵 {stream_name} volume → {parsed.get('volume', index)}",
+        stream=stream_name,
+        stream_id=stream_id,
+        requested=index,
+        actual=parsed.get("volume"),
+        volume_max=parsed.get("max"),
+    )
+
+
+def _handle_media_volume_adjust(
+    stream: Any, direction: str, show_ui: bool, serial: Optional[str]
+) -> Dict[str, Any]:
+    """Adjust volume up/down/same."""
+    stream_id = _resolve_stream(stream)
+    if stream_id is None:
+        return _err(
+            f"unknown stream '{stream}'. Valid: {sorted(AUDIO_STREAMS.keys())}"
+        )
+    direction = direction.lower().strip()
+    # Accept common English aliases
+    dir_map = {
+        "up":    "raise",
+        "raise": "raise",
+        "louder": "raise",
+        "higher": "raise",
+        "down":  "lower",
+        "lower": "lower",
+        "quieter": "lower",
+        "softer": "lower",
+        "same":  "same",
+        "keep":  "same",
+    }
+    if direction not in dir_map:
+        return _err(
+            f"direction must be one of {sorted(dir_map.keys())} (got '{direction}')"
+        )
+    adj = dir_map[direction]
+
+    args = ["shell", "cmd", "media_session", "volume",
+            "--stream", str(stream_id), "--adj", adj]
+    if show_ui:
+        args.append("--show")
+
+    r = _run(args, serial=serial, timeout=5)
+    if r["returncode"] != 0:
+        return _err(f"volume adjust failed: {r['stderr'][:120]}")
+
+    # Verify
+    verify = _run(
+        ["shell", "cmd", "media_session", "volume",
+         "--stream", str(stream_id), "--get"],
+        serial=serial, timeout=5,
+    )
+    parsed = _parse_volume_output(verify["stdout"] or "")
+
+    stream_name = AUDIO_STREAM_NAMES.get(stream_id, str(stream_id))
+    return _ok(
+        f"🎵 {stream_name} {adj} → {parsed.get('volume', '?')}",
+        stream=stream_name,
+        stream_id=stream_id,
+        direction=adj,
+        volume=parsed.get("volume"),
+        volume_max=parsed.get("max"),
+    )
+
+
+def _handle_media_sessions_list(serial: Optional[str]) -> Dict[str, Any]:
+    """List all media sessions parsed from dumpsys media_session.
+
+    Each session has: tag, package, userId, active (bool), state,
+    playbackState, and optionally metadata (title/artist/album).
+    """
+    r = _run(
+        ["shell", "dumpsys", "media_session"],
+        serial=serial, timeout=10,
+    )
+    if r["returncode"] != 0:
+        return _err(f"dumpsys media_session failed: {r['stderr'][:120]}")
+
+    sessions: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    in_metadata = False
+    metadata_buf: Dict[str, str] = {}
+
+    # Regex-free line-oriented parser
+    for raw in (r["stdout"] or "").splitlines():
+        stripped = raw.strip()
+        # Session header looks like:
+        #   "play_movies_media com.google.android.videos/play_movies_media/3 (userId=0)"
+        # It's indented 2 or 4 spaces, has "(userId=" at end
+        # Session headers look like:
+        #   "HeadsetMediaButton com.android.server.telecom/HeadsetMediaButton/1 (userId=0)"
+        # They have: one-word tag, then pkg/TAG/N (userId=U). Prose lines
+        # like "Global priority session is ..." and "3 sessions listeners"
+        # also contain "(userId=" but don't match the pkg/TAG/N shape.
+        is_header = False
+        tag = pkg = None
+        uid = None
+        if "(userId=" in stripped and "/" in stripped:
+            parts = stripped.split(" ", 1)
+            if len(parts) == 2:
+                cand_tag = parts[0]
+                rest = parts[1]
+                # Component must look like "pkg/TAG/N (userId=U)"
+                # The tag in component must match cand_tag
+                slash_parts = rest.split(" (userId=", 1)[0].split("/")
+                if (len(slash_parts) >= 2
+                        and slash_parts[1] == cand_tag
+                        and not cand_tag.startswith(("owner", "Global",
+                                                       "priority"))):
+                    is_header = True
+                    tag = cand_tag
+                    pkg = slash_parts[0]
+                    uid_part = rest.split("(userId=", 1)[-1].rstrip(")")
+                    try:
+                        uid = int(uid_part)
+                    except ValueError:
+                        uid = None
+
+        if is_header:
+            # Flush previous session
+            if current is not None:
+                current["metadata"] = metadata_buf
+                sessions.append(current)
+                metadata_buf = {}
+            current = {
+                "tag": tag,
+                "package": pkg,
+                "userId": uid,
+                "active": None,
+                "state": None,
+                "flags": None,
+            }
+        elif current is not None:
+            # Session attributes
+            if stripped.startswith("active="):
+                val = stripped.split("=", 1)[1].strip()
+                current["active"] = val.lower() == "true"
+            elif stripped.startswith("package="):
+                current["package"] = stripped.split("=", 1)[1].strip()
+            elif stripped.startswith("flags="):
+                current["flags"] = stripped.split("=", 1)[1].strip()
+            elif stripped.startswith("state=") and "PlaybackState" in stripped:
+                # "state=PlaybackState {state=PLAYING(3), position=...}"
+                state_part = stripped.split("state=", 2)
+                if len(state_part) >= 3:
+                    inner = state_part[2]
+                    # Grab just the state identifier
+                    if inner.startswith("PLAYING"):
+                        current["state"] = "PLAYING"
+                    elif inner.startswith("PAUSED"):
+                        current["state"] = "PAUSED"
+                    elif inner.startswith("STOPPED"):
+                        current["state"] = "STOPPED"
+                    elif inner.startswith("BUFFERING"):
+                        current["state"] = "BUFFERING"
+                    elif inner.startswith("NONE"):
+                        current["state"] = "NONE"
+                    else:
+                        current["state"] = inner.split("(", 1)[0].split(",", 1)[0]
+            elif stripped.startswith("state=null"):
+                current["state"] = None
+            elif stripped == "metadata:":
+                in_metadata = True
+            elif stripped.startswith("metadata="):
+                # metadata=null or metadata=Metadata { ... }
+                val = stripped.split("=", 1)[1].strip()
+                if val == "null":
+                    current["metadata_raw"] = None
+            elif in_metadata:
+                # Under "metadata:" block, look for android.media.metadata.* keys
+                # Lines often indented further. Try to pick key=value.
+                if "=" in stripped:
+                    k, v = stripped.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    # Shorten common keys
+                    if "TITLE" in k.upper():
+                        metadata_buf["title"] = v
+                    elif "ARTIST" in k.upper():
+                        metadata_buf["artist"] = v
+                    elif "ALBUM" in k.upper() and "ART" not in k.upper():
+                        metadata_buf["album"] = v
+                    elif "DURATION" in k.upper():
+                        metadata_buf["duration"] = v
+
+    # Flush last session
+    if current is not None:
+        current["metadata"] = metadata_buf
+        sessions.append(current)
+
+    # Stats
+    active_sessions = [s for s in sessions if s.get("active")]
+    playing_sessions = [
+        s for s in sessions if (s.get("state") == "PLAYING")
+    ]
+
+    lines = [
+        f"🎵 {len(sessions)} media sessions "
+        f"({len(active_sessions)} active, {len(playing_sessions)} playing):"
+    ]
+    for sess in sessions[:10]:
+        mark = "▶" if sess.get("state") == "PLAYING" else (
+            "⏸" if sess.get("state") == "PAUSED" else " "
+        )
+        act = "●" if sess.get("active") else "○"
+        lines.append(
+            f"  {mark} {act}  {sess.get('package', '?'):40s}  "
+            f"[{sess.get('state') or '—'}]"
+        )
+
+    return _ok(
+        "\n".join(lines),
+        sessions=sessions,
+        count=len(sessions),
+        active_count=len(active_sessions),
+        playing_count=len(playing_sessions),
+    )
+
+
+def _handle_media_now_playing(serial: Optional[str]) -> Dict[str, Any]:
+    """Return info about the currently-playing session (if any)."""
+    r = _handle_media_sessions_list(serial)
+    if r["status"] != "success":
+        return r
+
+    # Prefer PLAYING state, fallback to first active session
+    playing = [s for s in r["sessions"] if s.get("state") == "PLAYING"]
+    if not playing:
+        playing = [s for s in r["sessions"] if s.get("active")]
+
+    if not playing:
+        return _ok(
+            "🎵 nothing is playing",
+            playing=None,
+            sessions_count=r["count"],
+        )
+
+    sess = playing[0]
+    md = sess.get("metadata") or {}
+    title = md.get("title") or "?"
+    artist = md.get("artist") or "?"
+    album = md.get("album") or ""
+
+    summary = (
+        f"🎵 now playing in {sess.get('package')}\n"
+        f"   title:  {title}\n"
+        f"   artist: {artist}\n"
+        f"   album:  {album or '—'}\n"
+        f"   state:  {sess.get('state')}"
+    )
+    return _ok(
+        summary,
+        playing=sess,
+        package=sess.get("package"),
+        title=title,
+        artist=artist,
+        album=album,
+        state=sess.get("state"),
+    )
+
+
+
+# =============================================================================
 # 🔔  Notification Pipeline  (Frontier #11)
 # =============================================================================
 #
@@ -3037,6 +3517,9 @@ ACTIONS = {
     "notifications_list", "notifications_get", "notifications_snooze",
     "notifications_unsnooze", "notifications_post", "notifications_set_dnd",
     "notifications_dnd_package", "notifications_stats",
+    # Media session (v0.12.0)
+    "media_dispatch", "media_volume_get", "media_volume_set",
+    "media_volume_adjust", "media_sessions_list", "media_now_playing",
 }
 
 
@@ -3124,6 +3607,12 @@ def adb(
     notification_dnd_mode: str = "off",
     notification_package: Optional[str] = None,
     notification_allow: bool = True,
+    # Media session (v0.12.0)
+    media_key: Optional[str] = None,
+    media_stream: str = "music",
+    media_volume_index: int = 0,
+    media_volume_direction: str = "raise",
+    media_volume_show_ui: bool = False,
 ) -> Dict[str, Any]:
     """
     🤖 Control an Android device via adb.
@@ -3154,6 +3643,17 @@ def adb(
                      camera_video (duration_sec, facing, output_path)
             Stream:  log_stream_start (filters), log_stream_stop,
                      log_stream_status — pipes logcat → devduck event_bus
+            Media:   media_dispatch (media_key='play-pause'|'play'|'pause'|'next'|
+                     'previous'|'stop'|'rewind'|'fast-forward'|'mute'|'headsethook')
+                     → global media key (works across Spotify/YouTube/Music/etc).
+                     media_volume_get (media_stream='music'|'ring'|'alarm'|'voice'
+                     |'notification'|'accessibility'|...) → current volume.
+                     media_volume_set (media_stream=..., media_volume_index=0..max,
+                     media_volume_show_ui=True) → set volume to exact index.
+                     media_volume_adjust (media_stream=..., media_volume_direction=
+                     'up'|'down'|'same') → bump volume one step.
+                     media_sessions_list → all sessions with active/state.
+                     media_now_playing → currently playing session + metadata.
             Notif:   notifications_list → all active + per-pkg counts.
                      notifications_get (notification_key='0|pkg|id|tag|uid').
                      notifications_snooze / notifications_unsnooze.
@@ -3471,6 +3971,26 @@ def adb(
             )
         if action == "notifications_stats":
             return _handle_notifications_stats(serial)
+
+        # Media session (v0.12.0)
+        if action == "media_dispatch":
+            if not media_key:
+                return _err("media_dispatch requires media_key (e.g. 'play-pause', 'next')")
+            return _handle_media_dispatch(media_key, serial)
+        if action == "media_volume_get":
+            return _handle_media_volume_get(media_stream, serial)
+        if action == "media_volume_set":
+            return _handle_media_volume_set(
+                media_stream, media_volume_index, media_volume_show_ui, serial,
+            )
+        if action == "media_volume_adjust":
+            return _handle_media_volume_adjust(
+                media_stream, media_volume_direction, media_volume_show_ui, serial,
+            )
+        if action == "media_sessions_list":
+            return _handle_media_sessions_list(serial)
+        if action == "media_now_playing":
+            return _handle_media_now_playing(serial)
         if action == "dial":
             return _handle_dial(phone or "", call_now, serial)
         if action == "sms_compose":
