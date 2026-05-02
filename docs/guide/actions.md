@@ -62,7 +62,9 @@ graph TD
 | Action | Purpose |
 |--------|---------|
 | `screenshot` | Capture PNG + return as Converse image block |
-| `screen_record` / `screen_frames` | Record/extract frames |
+| `screen_record` | Blocking fixed-duration recording |
+| `screen_record_start` / `_stop` / `_status` | **Background recording** — record while agent acts |
+| `screen_frames` | Extract N live screenshots at intervals |
 | `video_frames` | Extract frames from an on-device video |
 | `ui_dump` | Raw UIAutomator XML |
 | `ui_find` | Find UI node by text / resource-id / content-desc |

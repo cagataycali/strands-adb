@@ -62,13 +62,28 @@ agent("take a screenshot and tell me what app is open")
 
 Disable with `include_image=False` if you just want the file path.
 
+## 🎬 Record What The Agent Does
+
+Non-blocking screen recording — start before the agent acts, stop after. Review the video to see what actually happened.
+
+```python
+adb(action="screen_record_start", output_path="/tmp/run.mp4")
+
+agent("open whatsapp and reply to mom")   # agent works while recording
+
+result = adb(action="screen_record_stop")
+print(result["merged_path"])   # single mp4, auto-stitched past 180s
+```
+
+→ [Screen Recording guide](https://cagataycali.github.io/strands-adb/guide/screen-recording/)
+
 ## 90+ Actions, One Tool
 
 | Domain | Actions |
 |--------|---------|
 | **Device** | list, select, info, battery, wake, unlock |
 | **UI**     | tap, swipe, type, key, gestures, smart_tap |
-| **Screen** | screenshot (image block), record, frames, ui_dump, ui_find |
+| **Screen** | screenshot (image block), screen_record, **screen_record_start/stop** (bg), frames, ui_dump, ui_find |
 | **Apps**   | list, launch, kill, install, uninstall, clear_data |
 | **Files**  | push, pull, ls |
 | **Intents**| open_url, share_text, start_activity |

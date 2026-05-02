@@ -154,8 +154,47 @@ Returns `{path, size_bytes, content: [text, image]}`.
 
 ### `screen_record`
 
+Blocking fixed-duration recording (≤180s Android hard limit).
+
 ```python
 adb(action="screen_record", duration_sec=30, output_path=None, serial=None)
+```
+
+### `screen_record_start`
+
+Start a **non-blocking** background recording. Returns immediately so your
+agent can keep acting. Auto-chains segments past Android's 180s cap.
+
+```python
+adb(
+    action="screen_record_start",
+    output_path="/tmp/run.mp4",
+    screenrec_bit_rate_mbps=4,
+    screenrec_size="720x1600",   # None = native resolution
+    screenrec_segment_sec=180,
+)
+```
+
+### `screen_record_stop`
+
+Stop background recording. Pulls any remaining segment, optionally merges
+all segments via `ffmpeg` if present.
+
+```python
+result = adb(action="screen_record_stop")
+# {
+#   "segments":   ["/tmp/run.mp4", "/tmp/run_seg002.mp4", ...],
+#   "merged_path": "/tmp/run_merged.mp4",   # if ffmpeg available
+#   "duration_sec": 412.3,
+#   "total_bytes": 198_234_112,
+# }
+```
+
+### `screen_record_status`
+
+```python
+adb(action="screen_record_status")
+# {"running": True, "elapsed_sec": 47.3, "segments": [...], "output_path": "..."}
 ```
 
 ### `screen_frames`

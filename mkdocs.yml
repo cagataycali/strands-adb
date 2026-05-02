@@ -23,6 +23,7 @@ nav:
     - Sensors & Thermals: guide/sensors.md
     - Settings Mutation: guide/settings.md
     - Logcat Streaming: guide/logcat.md
+    - Screen Recording: guide/screen-recording.md
     - Accessibility: guide/accessibility.md
     - DevDuck Integration: guide/devduck.md
     - SSH / Wireless ADB: guide/ssh.md
