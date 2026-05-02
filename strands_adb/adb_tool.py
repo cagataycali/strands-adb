@@ -830,6 +830,239 @@ def _handle_wifi_info(serial: Optional[str]) -> Dict[str, Any]:
     )
 
 
+def _screenrec_background_loop(
+    serial: Optional[str],
+    bit_rate_mbps: int,
+    size: Optional[str],
+    segment_sec: int,
+) -> None:
+    """Record screen in chained segments until stop_flag is set.
+
+    Each segment is `segment_sec` seconds (capped at 180 by Android).
+    Segments are pulled to local on-the-fly so stop() is fast.
+    """
+    s = serial or _SELECTED_SERIAL
+    seg_idx = 0
+    while not _SCREENREC_STATE["stop_flag"]:
+        seg_idx += 1
+        remote = f"/sdcard/_ddrec_{int(time.time())}_{seg_idx:03d}.mp4"
+        cmd = [_adb_bin()]
+        if s:
+            cmd += ["-s", s]
+        shell_args = ["shell", f"screenrecord --time-limit {segment_sec} "
+                               f"--bit-rate {bit_rate_mbps * 1_000_000}"]
+        if size:
+            shell_args[-1] += f" --size {size}"
+        shell_args[-1] += f" {remote}"
+        cmd += shell_args
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with _SCREENREC_STATE["lock"]:
+                _SCREENREC_STATE["process"] = proc
+            # Poll for stop_flag every 0.5s so we can kill early
+            start = time.time()
+            while time.time() - start < segment_sec + 5:
+                if _SCREENREC_STATE["stop_flag"]:
+                    try:
+                        # SIGINT to screenrecord finalizes the mp4 properly
+                        proc.send_signal(2)  # SIGINT
+                        proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+            # Give the device a beat to finalize
+            time.sleep(0.8)
+        except Exception:
+            break
+
+        _SCREENREC_STATE["segments_remote"].append(remote)
+
+        # Pull this segment immediately so stop() doesn't have to wait
+        local_dir = Path(_SCREENREC_STATE["output_path"] or f"/tmp/adb_rec_{int(time.time())}.mp4").parent
+        local_dir.mkdir(parents=True, exist_ok=True)
+        base = Path(_SCREENREC_STATE["output_path"] or f"/tmp/adb_rec.mp4")
+        if seg_idx == 1 and not _SCREENREC_STATE["stop_flag"]:
+            # first segment with segments to come → number them
+            local_path = base
+        elif seg_idx == 1:
+            local_path = base
+        else:
+            local_path = base.with_name(
+                f"{base.stem}_seg{seg_idx:03d}{base.suffix}"
+            )
+        try:
+            _run(["pull", remote, str(local_path)], serial=serial, timeout=60)
+            _run(["shell", "rm", remote], serial=serial)
+            _SCREENREC_STATE["segments_local"].append(str(local_path))
+        except Exception:
+            pass
+
+        if _SCREENREC_STATE["stop_flag"]:
+            break
+
+
+def _handle_screen_record_start(
+    serial: Optional[str],
+    output_path: Optional[str],
+    bit_rate_mbps: int = 4,
+    size: Optional[str] = None,
+    segment_sec: int = 180,
+) -> Dict[str, Any]:
+    """Start a BACKGROUND screen recording. Returns immediately."""
+    if _SCREENREC_STATE["running"]:
+        return {
+            "status": "success",
+            "content": [{"text": f"🎬 screen recording already running "
+                                  f"(started {time.time() - (_SCREENREC_STATE['started_at'] or 0):.0f}s ago, "
+                                  f"{len(_SCREENREC_STATE['segments_local'])} segments so far)"}],
+            "already_running": True,
+        }
+    if segment_sec > 180:
+        segment_sec = 180  # Android hard limit
+    if segment_sec < 10:
+        segment_sec = 10
+
+    # Reset state
+    _SCREENREC_STATE["running"] = True
+    _SCREENREC_STATE["stop_flag"] = False
+    _SCREENREC_STATE["serial"] = serial or _SELECTED_SERIAL
+    _SCREENREC_STATE["started_at"] = time.time()
+    _SCREENREC_STATE["segments_remote"] = []
+    _SCREENREC_STATE["segments_local"] = []
+    _SCREENREC_STATE["output_path"] = output_path or f"/tmp/adb_rec_{int(time.time())}.mp4"
+    _SCREENREC_STATE["bit_rate_mbps"] = bit_rate_mbps
+    _SCREENREC_STATE["size"] = size
+    _SCREENREC_STATE["segment_sec"] = segment_sec
+
+    t = threading.Thread(
+        target=_screenrec_background_loop,
+        args=(serial, bit_rate_mbps, size, segment_sec),
+        daemon=True,
+        name="strands-adb-screenrec",
+    )
+    _SCREENREC_STATE["thread"] = t
+    t.start()
+
+    return _ok(
+        f"🎬 screen recording started in background "
+        f"(bit_rate={bit_rate_mbps}Mbps, size={size or 'native'}, "
+        f"segment={segment_sec}s, output={_SCREENREC_STATE['output_path']})",
+        output_path=_SCREENREC_STATE["output_path"],
+        pid=_SCREENREC_STATE.get("process").pid if _SCREENREC_STATE.get("process") else None,
+    )
+
+
+def _handle_screen_record_stop(serial: Optional[str] = None) -> Dict[str, Any]:
+    """Stop background recording, pull remaining segments, return final path(s)."""
+    if not _SCREENREC_STATE["running"]:
+        return {"status": "success",
+                "content": [{"text": "🎬 screen recording is not running"}]}
+
+    _SCREENREC_STATE["stop_flag"] = True
+    _SCREENREC_STATE["running"] = False
+
+    # Kill the current segment's adb process if still alive
+    proc = _SCREENREC_STATE.get("process")
+    if proc and proc.poll() is None:
+        try:
+            proc.send_signal(2)  # SIGINT
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    # Wait for the background thread to finish pulling
+    t = _SCREENREC_STATE.get("thread")
+    if t and t.is_alive():
+        t.join(timeout=15)
+
+    duration = time.time() - (_SCREENREC_STATE.get("started_at") or time.time())
+    locals_ = list(_SCREENREC_STATE["segments_local"])
+    total_bytes = 0
+    for p in locals_:
+        try:
+            total_bytes += Path(p).stat().st_size
+        except Exception:
+            pass
+
+    # If multiple segments and ffmpeg available, try to concat
+    final_path = _SCREENREC_STATE["output_path"]
+    concat_path = None
+    if len(locals_) > 1 and shutil.which("ffmpeg"):
+        try:
+            base = Path(final_path)
+            concat_list = base.with_suffix(".concat.txt")
+            concat_list.write_text(
+                "\n".join(f"file '{Path(p).absolute()}'" for p in locals_)
+            )
+            merged = base.with_name(f"{base.stem}_merged{base.suffix}")
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(concat_list), "-c", "copy", str(merged)],
+                capture_output=True, timeout=60,
+            )
+            if merged.exists():
+                concat_path = str(merged)
+            try:
+                concat_list.unlink()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _SCREENREC_STATE["thread"] = None
+    _SCREENREC_STATE["process"] = None
+
+    msg_parts = [
+        f"🎬 recording stopped after {duration:.1f}s",
+        f"{len(locals_)} segment(s), {total_bytes:,} bytes total",
+    ]
+    if concat_path:
+        msg_parts.append(f"merged → {concat_path}")
+    elif locals_:
+        msg_parts.append(f"first segment → {locals_[0]}")
+
+    return _ok(
+        " | ".join(msg_parts),
+        segments=locals_,
+        merged_path=concat_path,
+        duration_sec=duration,
+        total_bytes=total_bytes,
+    )
+
+
+def _handle_screen_record_status() -> Dict[str, Any]:
+    """Check if background screen recording is active."""
+    if not _SCREENREC_STATE["running"]:
+        return {"status": "success",
+                "content": [{"text": "🎬 not recording"}],
+                "running": False}
+    elapsed = time.time() - (_SCREENREC_STATE.get("started_at") or time.time())
+    return {
+        "status": "success",
+        "content": [{"text": f"🎬 recording for {elapsed:.0f}s, "
+                              f"{len(_SCREENREC_STATE['segments_local'])} segment(s) pulled, "
+                              f"output={_SCREENREC_STATE['output_path']}"}],
+        "running": True,
+        "elapsed_sec": elapsed,
+        "segments": list(_SCREENREC_STATE["segments_local"]),
+        "output_path": _SCREENREC_STATE["output_path"],
+    }
+
+
 def _handle_screen_record(
     duration_sec: int,
     output_path: Optional[str],
@@ -965,6 +1198,27 @@ _LOGCAT_STATE: Dict[str, Any] = {
     "filters": [],
     "events_parsed": 0,
     "started_at": None,
+    "lock": threading.Lock(),
+}
+
+# ── Background screen recorder state ─────────────────────────────────────────
+# screenrecord on Android has a hard 180s limit per invocation. We spawn it
+# as a background adb shell process, and auto-chain new segments if the user
+# wants to record longer than 180s. Stop pulls all segments and (optionally)
+# concatenates them via ffmpeg if present.
+_SCREENREC_STATE: Dict[str, Any] = {
+    "running": False,
+    "process": None,
+    "thread": None,
+    "serial": None,
+    "started_at": None,
+    "stop_flag": False,
+    "segments_remote": [],   # list of /sdcard/*.mp4 on device
+    "segments_local": [],    # list of pulled local paths
+    "output_path": None,     # where the final/first segment ends up
+    "bit_rate_mbps": 4,
+    "size": None,            # e.g. "720x1280", None = native
+    "segment_sec": 180,      # per-segment duration cap (Android limit)
     "lock": threading.Lock(),
 }
 
@@ -6336,7 +6590,7 @@ ACTIONS = {
     "notifications_parsed", "ui_find", "smart_tap",
     "sensors", "thermals", "wifi_info",
     # media + comms
-    "screen_record", "dial", "sms_compose", "media", "volume",
+    "screen_record", "screen_record_start", "screen_record_stop", "screen_record_status", "dial", "sms_compose", "media", "volume",
     # camera (v0.4.0)
     "camera_photo", "camera_video",
     # logcat stream (v0.5.0)
@@ -6819,6 +7073,17 @@ def adb(
             return _handle_wifi_info(serial)
         if action == "screen_record":
             return _handle_screen_record(duration_sec, output_path, serial)
+        if action == "screen_record_start":
+            return _handle_screen_record_start(
+                serial, output_path,
+                bit_rate_mbps=screenrec_bit_rate_mbps,
+                size=screenrec_size,
+                segment_sec=screenrec_segment_sec,
+            )
+        if action == "screen_record_stop":
+            return _handle_screen_record_stop(serial)
+        if action == "screen_record_status":
+            return _handle_screen_record_status()
         if action == "camera_photo":
             return _handle_camera_photo(
                 output_path, serial, facing, auto_pull,
