@@ -6730,6 +6730,10 @@ def adb(
     media_volume_index: int = 0,
     media_volume_direction: str = "raise",
     media_volume_show_ui: bool = False,
+    # Screen recording (v0.19.0)
+    screenrec_bit_rate_mbps: int = 4,
+    screenrec_size: Optional[str] = None,
+    screenrec_segment_sec: int = 180,
     # Connectivity (v0.13.0)
     wifi_enabled: bool = True,
     wifi_ssid: Optional[str] = None,
