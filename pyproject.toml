@@ -28,6 +28,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "pytest-asyncio", "ruff", "mypy"]
 vision = ["Pillow>=10"]
+mcp = ["strands-mcp-server"]
+
+[project.scripts]
+strands-adb-mcp = "strands_adb.mcp:main"
 
 [project.urls]
 Homepage = "https://github.com/cagataycali/strands-adb"

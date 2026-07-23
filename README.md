@@ -50,6 +50,38 @@ export DEVDUCK_TOOLS="strands_adb:adb;strands_tools:shell"
 devduck "open whatsapp and read the last message from mom"
 ```
 
+## MCP Server (Claude Code / Claude Desktop / Cursor / any MCP client)
+
+Expose `adb` + `recorder` over the [Model Context Protocol](https://modelcontextprotocol.io):
+
+```bash
+pip install "strands-adb[mcp]"
+
+# stdio mode (default) — for Claude Code / Claude Desktop
+strands-adb-mcp
+
+# HTTP mode — multi-client, background-capable
+strands-adb-mcp --http --port 8000
+```
+
+**Claude Code:**
+```bash
+claude mcp add strands-adb -- strands-adb-mcp
+```
+
+**Claude Desktop** (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "strands-adb": {
+      "command": "strands-adb-mcp"
+    }
+  }
+}
+```
+
+Now any MCP client can control your Android device — screenshots, UI automation, app control, sensors, everything.
+
 ---
 
 ## 👁️ Agent can SEE the screen
