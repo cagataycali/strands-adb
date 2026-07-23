@@ -2,5 +2,5 @@
 from strands_adb.adb_tool import adb
 from strands_adb.recorder import recorder
 
-__version__ = "0.19.2"
+__version__ = "0.19.3"
 __all__ = ["adb", "recorder"]
