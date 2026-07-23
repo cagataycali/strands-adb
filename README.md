@@ -54,19 +54,19 @@ devduck "open whatsapp and read the last message from mom"
 
 Expose `adb` + `recorder` over the [Model Context Protocol](https://modelcontextprotocol.io):
 
-```bash
-pip install "strands-adb[mcp]"
+No install needed — just `uvx`:
 
+```bash
 # stdio mode (default) — for Claude Code / Claude Desktop
-strands-adb-mcp
+uvx strands-adb
 
 # HTTP mode — multi-client, background-capable
-strands-adb-mcp --http --port 8000
+uvx strands-adb --http --port 8000
 ```
 
 **Claude Code:**
 ```bash
-claude mcp add strands-adb -- strands-adb-mcp
+claude mcp add strands-adb -- uvx strands-adb
 ```
 
 **Claude Desktop** (`claude_desktop_config.json`):
@@ -74,11 +74,22 @@ claude mcp add strands-adb -- strands-adb-mcp
 {
   "mcpServers": {
     "strands-adb": {
-      "command": "strands-adb-mcp"
+      "command": "uvx",
+      "args": ["strands-adb"]
     }
   }
 }
 ```
+
+<details>
+<summary>Prefer pip?</summary>
+
+```bash
+pip install "strands-adb[mcp]"
+strands-adb-mcp                    # stdio
+strands-adb-mcp --http --port 8000 # HTTP
+```
+</details>
 
 Now any MCP client can control your Android device — screenshots, UI automation, app control, sensors, everything.
 
