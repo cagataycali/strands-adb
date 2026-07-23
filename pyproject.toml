@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
   "strands-agents",
+  "strands-mcp-server",
 ]
 
 [project.optional-dependencies]
